@@ -13,12 +13,13 @@ from google import genai
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 CONFIG = {
-    "SYMBOL": "GC=F",           # ทองคำ Gold Futures (XAUUSD)
+    # เปลี่ยนเป็น PAXG-USD (Spot Gold 1:1 London Benchmark) เพื่อให้ราคาตรงกับ XAUUSD ใน MT5
+    "SYMBOL": "PAXG-USD",       
     "INTERVAL": "15m",          # กรอบเวลา 15 นาที
     "CHECK_INTERVAL_SEC": 300,  # ตรวจสอบกราฟทุก 5 นาที
     "HISTORY_PERIOD": "5d",
     "MIN_RR_RATIO": 2.0,
-    "STATS_FILE": "stats.json"  # บันทึกสถิติลงไฟล์ป้องกันข้อมูลหาย
+    "STATS_FILE": "stats.json"
 }
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -58,7 +59,6 @@ def send_discord_message(embed_data):
         logging.warning("ไม่พบ DISCORD_WEBHOOK_URL")
         return
     try:
-        # นำ avatar_url ออกเพื่อให้ Discord ดึงรูปโปรไฟล์ที่คุณตั้งไว้ในแอปมาแสดงผล
         payload = {
             "embeds": [embed_data]
         }
@@ -241,10 +241,10 @@ def gemini_advanced_validation(setup):
         return fallback_decision
 
     prompt = f"""
-    คุณเป็นนักวิเคราะห์ระบบเทรดทองคำ (XAUUSD) ที่เชี่ยวชาญ SMC, Price Action และ Multi-Indicator Confluence
+    คุณเป็นนักวิเคราะห์ระบบเทรดทองคำ Spot Gold (XAUUSD) ที่เชี่ยวชาญ SMC, Price Action และ Multi-Indicator Confluence
     ตรวจพบสัญญาณ:
     - สัญญาณหลัก: {setup['signal']}
-    - ราคา: {setup['current_price']} | โซน FVG: {setup['fvg_type']} ({setup['fvg_bottom']} - {setup['fvg_top']})
+    - ราคา Spot ล่าสุด: {setup['current_price']} | โซน FVG: {setup['fvg_type']} ({setup['fvg_bottom']} - {setup['fvg_top']})
     - EMA 20/50/200: {setup['ema20']} / {setup['ema50']} / {setup['ema200']}
     - RSI: {setup['rsi']} | ATR: {setup['atr']}
     - สวิงราคาสุด: High {setup['recent_high']} / Low {setup['recent_low']}
@@ -325,23 +325,18 @@ def check_active_trade(current_price):
 
         win_rate = (performance_stats["wins"] / performance_stats["total"]) * 100
         
-        # ดีไซน์การ์ดผลลัพธ์แบบ Cyberpunk / Quant Terminal
         is_win = (outcome == "WIN")
         embed_color = 0x00FFA3 if is_win else 0xFF2A6D
         status_banner = "🎯 [TRADE TARGET HIT // PROFIT LOCKED]" if is_win else "🛑 [STOP LOSS TRIGGERED // RISK MITIGATED]"
         pnl_sign = "+" if pnl > 0 else ""
         
         embed = {
-            "author": {
-                "name": "TRADE EXECUTION MONITOR // ORDER CLOSED",
-                "icon_url": "https://cdn-icons-png.flaticon.com/512/2620/2620604.png"
-            },
             "title": status_banner,
             "description": f"```diff\n{'+' if is_win else '-'} RESULT: {outcome} ({side} ORDER)\n{'+' if is_win else '-'} PnL: {pnl_sign}{pnl:.2f} PTS ({pnl_sign}{int(pnl*10)} PIPS)\n```",
             "color": embed_color,
             "fields": [
                 {
-                    "name": "📌 รายละเอียดราคา",
+                    "name": "📌 รายละเอียดราคา (Spot Gold)",
                     "value": f"• จุดเข้า: `{entry:.2f}`\n• จุดปิด: `{current_price:.2f}`",
                     "inline": True
                 },
@@ -357,7 +352,7 @@ def check_active_trade(current_price):
                 }
             ],
             "footer": {
-                "text": "QUANT ALPHA ENGINE • SMC & FVG AUTOMATION",
+                "text": "QUANT ALPHA ENGINE • SPOT GOLD REAL-TIME",
                 "icon_url": "https://cdn-icons-png.flaticon.com/512/1006/1006771.png"
             },
             "timestamp": datetime.now(pytz.utc).isoformat()
@@ -372,14 +367,14 @@ def run_bot_cycle():
 
         df = yf.download(CONFIG["SYMBOL"], period=CONFIG["HISTORY_PERIOD"], interval=CONFIG["INTERVAL"], progress=False)
         if df.empty:
-            logging.info("รอข้อมูลแท่งเทียน...")
+            logging.info("รอข้อมูลแท่งเทียน Spot Gold...")
             return
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [col[0] for col in df.columns]
 
         current_price = float(df["Close"].iloc[-1])
-        logging.info(f"เช็กราคาทองคำล่าสุด: {current_price}")
+        logging.info(f"เช็กราคาทองคำ Spot ล่าสุด: {current_price:.2f}")
 
         if active_order:
             check_active_trade(current_price)
@@ -399,24 +394,18 @@ def run_bot_cycle():
         win_rate = (performance_stats["wins"] / performance_stats["total"] * 100) if performance_stats["total"] > 0 else 0.0
 
         is_buy = decision["action"] == "BUY"
-        embed_color = 0x00F0FF if is_buy else 0xFF0055  # Neon Cyan สำหรับ BUY / Neon Crimson สำหรับ SELL
+        embed_color = 0x00F0FF if is_buy else 0xFF0055
         side_icon = "🟢 BUY LONG" if is_buy else "🔴 SELL SHORT"
         
-        # คำนวณระยะ SL และ TP เป็นจุด
         sl_points = abs(decision["entry"] - decision["sl"])
         tp_points = abs(decision["tp"] - decision["entry"])
         rr_ratio = (tp_points / sl_points) if sl_points > 0 else 2.0
 
-        # จัดข้อความยืนยัน Confluence แบบ Tree Structure
         factors_formatted = "\n".join([f"├ ⚡ {f}" for f in setup["factors"][:-1]])
         if setup["factors"]:
             factors_formatted += f"\n└ ⚡ {setup['factors'][-1]}"
 
         embed = {
-            "author": {
-                "name": "QUANT TRADING ENGINE // AI ALPHA SIGNAL",
-                "icon_url": "https://cdn-icons-png.flaticon.com/512/2091/2091665.png"
-            },
             "title": f"⚡ NEW SIGNAL: {side_icon} (XAUUSD / M15)",
             "description": (
                 f">>> **กลยุทธ์:** `SMC + Multi-Confluence Matrix`\n"
@@ -426,7 +415,7 @@ def run_bot_cycle():
             "color": embed_color,
             "fields": [
                 {
-                    "name": "🎯 แผนราคา (Trade Parameters)",
+                    "name": "🎯 แผนราคา Spot Gold (Trade Parameters)",
                     "value": (
                         f"```yaml\n"
                         f"ENTRY : {decision['entry']:.2f}\n"
@@ -454,19 +443,19 @@ def run_bot_cycle():
                 }
             ],
             "footer": {
-                "text": "Gemini AI Flash • SMC Liquidity Engine • Timeframe 15M",
+                "text": "Gemini AI Flash • Spot Gold Real-Time • Timeframe 15M",
                 "icon_url": "https://cdn-icons-png.flaticon.com/512/2586/2586057.png"
             },
             "timestamp": datetime.now(pytz.utc).isoformat()
         }
         send_discord_message(embed)
-        logging.info(f"ส่งซิกแนล {decision['action']} เข้า Discord แบบ High-Tech เรียบร้อย!")
+        logging.info(f"ส่งซิกแนล Spot {decision['action']} เข้า Discord เรียบร้อย!")
 
     except Exception as e:
         logging.error(f"รอบการทำงานผิดพลาด: {e}")
 
 def main():
-    logging.info("🚀 Hybrid Quant Bot (SMC + FVG + Thai Forex News) เริ่มทำงานแล้ว...")
+    logging.info("🚀 Spot Gold Quant Bot (SMC + FVG + Thai Forex News) เริ่มทำงานแล้ว...")
     while True:
         run_bot_cycle()
         time.sleep(CONFIG["CHECK_INTERVAL_SEC"])
