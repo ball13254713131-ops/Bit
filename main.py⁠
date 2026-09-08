@@ -1,516 +1,1346 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================================
+ INSTITUTIONAL SPOT GOLD (XAUUSD) SMC TRADING BOT — PRODUCTION SINGLE-FILE
+==========================================================================================
+ สถาปัตยกรรม 6 ชั้น:
+   [Layer 1] Market Data Feed (PAXG-USD) + Multi-Timeframe (H1 Bias / M15 Execution)
+   [Layer 2] Time & Volatility Filter (Gold Killzones, Asia/Bangkok GMT+7)
+   [Layer 3] Institutional SMC Logic (Premium/Discount, Liquidity Sweep, FVG, Momentum)
+   [Layer 4] News Blackout Engine (Forex Factory Weekly JSON, USD High Impact)
+   [Layer 5] Advanced AI Brain (Chain-of-Thought Validation: Gemini / Claude + Fallback)
+   [Layer 6] Discord Alert + Performance Tracker + 24/7 Keep-Alive Web Server
+==========================================================================================
+"""
+
 import os
-import time
+import sys
 import json
+import time
+import math
+import threading
 import logging
-from datetime import datetime
+import traceback
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import pytz
 import requests
+import numpy as np
 import pandas as pd
-import yfinance as yf
-from google import genai
 
-# ตั้งค่า Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+try:
+    import yfinance as yf
+except Exception as _e:
+    print("ต้องติดตั้ง yfinance ก่อน: pip install yfinance")
+    raise
 
-CONFIG = {
-    # PAXG-USD (Spot Gold 1:1 London Benchmark) ราคาตรงกับ XAUUSD ใน MT5
-    "SYMBOL": "PAXG-USD",       
-    "INTERVAL": "15m",          # กรอบเวลา 15 นาที
-    "CHECK_INTERVAL_SEC": 300,  # ตรวจสอบกราฟทุก 5 นาที
-    "HEARTBEAT_INTERVAL_SEC": 10800, # ส่งการ์ดรายงานตัวทุก 3 ชั่วโมง (10,800 วินาที)
-    "HISTORY_PERIOD": "5d",
-    "MIN_RR_RATIO": 2.0,
-    "STATS_FILE": "stats.json"
+
+# ==========================================================================================
+# SECTION 0 : CONFIGURATION (อ่านค่าจาก Environment Variables ของ Render)
+# ==========================================================================================
+class CFG:
+    # ---------- Asset & Timeframes ----------
+    SYMBOL = os.getenv("SYMBOL", "PAXG-USD")   # Spot Gold 1:1 (London Benchmark) ไม่มีพรีเมียมฟิวเจอร์ส
+    HTF_INTERVAL = "60m"                        # Higher Timeframe = H1 (Directional Bias)
+    LTF_INTERVAL = "15m"                        # Lower Timeframe  = M15 (Execution)
+    HTF_PERIOD = "60d"                          # ช่วงข้อมูลย้อนหลังสำหรับ H1 (พอสำหรับ EMA200)
+    LTF_PERIOD = "20d"                          # ช่วงข้อมูลย้อนหลังสำหรับ M15
+    SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "300"))   # สแกนทุก 5 นาที
+
+    # ---------- Timezone ----------
+    TZ_NAME = "Asia/Bangkok"
+    TZ = pytz.timezone("Asia/Bangkok")
+
+    # ---------- Killzones (เวลาไทย GMT+7) ----------
+    KILLZONES = [
+        {"name": "LONDON_OPEN_KZ", "start": (14, 0), "end": (17, 30)},
+        {"name": "NEWYORK_OVERLAP_KZ", "start": (19, 30), "end": (23, 30)},
+    ]
+    TRADE_WEEKDAYS = {0, 1, 2, 3, 4}   # จันทร์-ศุกร์ (0=Mon)
+
+    # ---------- SMC Parameters ----------
+    HTF_SWING_LOOKBACK = 20      # H1 Swing สำหรับ Premium/Discount
+    LTF_SWING_LOOKBACK = 30      # M15 มองหา Liquidity Pool
+    SWEEP_WINDOW = 6             # ตรวจ Sweep ภายใน 6 แท่งล่าสุด (M15)
+    FVG_SCAN_BARS = 25           # สแกนหา FVG ย้อนหลัง (M15)
+    FVG_MIN_SIZE_ATR = 0.15      # FVG ต้องมีขนาดอย่างน้อย 15% ของ ATR
+    EMA_PERIOD = 200             # EMA 200 บน H1
+    RSI_PERIOD = 14
+    ATR_PERIOD = 14
+    RSI_BUY_RANGE = (45.0, 65.0)
+    RSI_SELL_RANGE = (35.0, 55.0)
+    EQ_BUFFER = 0.02             # Buffer 50% Equilibrium
+
+    # ---------- Risk ----------
+    MIN_RR = float(os.getenv("MIN_RR", "2.0"))       # บังคับ R:R ขั้นต่ำ 1:2.0
+    SL_ATR_BUFFER = 1.2                              # Fallback SL = Swing + 1.2 * ATR
+    MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", "2"))
+    SIGNAL_COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MIN", "45"))
+    ACCOUNT_RISK_USD = float(os.getenv("ACCOUNT_RISK_USD", "100"))
+
+    # ---------- News Blackout ----------
+    FF_CALENDAR_URL = os.getenv(
+        "FF_CALENDAR_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    )
+    NEWS_BLACKOUT_BEFORE_MIN = int(os.getenv("NEWS_BLACKOUT_BEFORE_MIN", "30"))
+    NEWS_BLACKOUT_AFTER_MIN = int(os.getenv("NEWS_BLACKOUT_AFTER_MIN", "30"))
+    NEWS_REFRESH_SEC = 3600 * 6   # รีเฟรชปฏิทินข่าวทุก 6 ชั่วโมง
+
+    # ---------- AI Brain ----------
+    AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+    # รองรับ fallback ระหว่าง gemini-2.5-flash และ gemini-1.5-flash
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
+    CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+    AI_TIMEOUT = int(os.getenv("AI_TIMEOUT", "30"))
+
+    # ---------- Discord (รองรับทั้งสองชื่อ Env) ----------
+    DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK", "")
+    HEARTBEAT_HOURS = int(os.getenv("HEARTBEAT_HOURS", "3"))
+
+    # ---------- Persistence ----------
+    STATS_FILE = os.getenv("STATS_FILE", "stats.json")
+    TRADES_FILE = os.getenv("TRADES_FILE", "active_trades.json")
+
+    # ---------- Web Server ----------
+    PORT = int(os.getenv("PORT", "8080"))
+
+    # ---------- Gold Conversion ----------
+    POINT_VALUE = 0.01
+    PIP_VALUE = 0.10
+
+
+# ==========================================================================================
+# SECTION 0.1 : LOGGING & UTILS
+# ==========================================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("XAUUSD-SMC")
+FILE_LOCK = threading.Lock()
+
+
+def now_th() -> datetime:
+    return datetime.now(CFG.TZ)
+
+
+def fmt_th(dt: datetime) -> str:
+    if dt is None:
+        return "-"
+    if dt.tzinfo is None:
+        dt = CFG.TZ.localize(dt)
+    return dt.astimezone(CFG.TZ).strftime("%d/%m/%Y %H:%M:%S")
+
+
+def safe_float(x, default=0.0) -> float:
+    try:
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+# ==========================================================================================
+# SECTION 1 : MARKET DATA FEED & MULTI-TIMEFRAME ANALYSIS
+# ==========================================================================================
+class MarketDataFeed:
+    def __init__(self):
+        self._cache = {}
+        self._cache_ts = {}
+
+    def _download(self, interval: str, period: str, retries: int = 3) -> pd.DataFrame:
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                tkr = yf.Ticker(CFG.SYMBOL)
+                df = tkr.history(period=period, interval=interval, auto_adjust=False)
+                if df is None or df.empty:
+                    raise ValueError("ได้ DataFrame ว่างเปล่าจาก yfinance")
+
+                df = df.rename(columns={c: c.capitalize() for c in df.columns})
+                need = ["Open", "High", "Low", "Close"]
+                for c in need:
+                    if c not in df.columns:
+                        raise ValueError(f"ไม่พบคอลัมน์ {c} ในข้อมูลที่ได้")
+
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize("UTC")
+                df.index = df.index.tz_convert(CFG.TZ)
+
+                df = df[~df.index.duplicated(keep="last")]
+                df = df.dropna(subset=need).sort_index()
+
+                if len(df) < 30:
+                    raise ValueError(f"ข้อมูลน้อยเกินไป ({len(df)} แท่ง)")
+
+                return df
+            except Exception as e:
+                last_err = e
+                log.warning(f"[DataFeed] ดึงข้อมูล {interval} ล้มเหลว (ครั้งที่ {attempt}/{retries}): {e}")
+                time.sleep(2 * attempt)
+        log.error(f"[DataFeed] ดึงข้อมูล {interval} ไม่สำเร็จ: {last_err}")
+        return pd.DataFrame()
+
+    def get_htf(self) -> pd.DataFrame:
+        return self._download(CFG.HTF_INTERVAL, CFG.HTF_PERIOD)
+
+    def get_ltf(self) -> pd.DataFrame:
+        return self._download(CFG.LTF_INTERVAL, CFG.LTF_PERIOD)
+
+    def get_live_price(self) -> float:
+        key = "live"
+        if key in self._cache and (time.time() - self._cache_ts.get(key, 0)) < 20:
+            return self._cache[key]
+        try:
+            tkr = yf.Ticker(CFG.SYMBOL)
+            fi = getattr(tkr, "fast_info", None)
+            price = None
+            if fi:
+                price = safe_float(fi.get("last_price") if isinstance(fi, dict) else getattr(fi, "last_price", 0.0))
+            if not price:
+                d = tkr.history(period="1d", interval="1m")
+                if d is not None and not d.empty:
+                    price = safe_float(d["Close"].iloc[-1], 0.0)
+            if price:
+                self._cache[key] = price
+                self._cache_ts[key] = time.time()
+                return price
+        except Exception as e:
+            log.warning(f"[DataFeed] ดึงราคา live ไม่สำเร็จ: {e}")
+        return self._cache.get(key, 0.0)
+
+
+# ==========================================================================================
+# SECTION 1.1 : TECHNICAL INDICATORS
+# ==========================================================================================
+class Indicators:
+    @staticmethod
+    def ema(series: pd.Series, period: int) -> pd.Series:
+        return series.ewm(span=period, adjust=False).mean()
+
+    @staticmethod
+    def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+        delta = series.diff()
+        gain = delta.clip(lower=0.0)
+        loss = -delta.clip(upper=0.0)
+        avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        out = 100 - (100 / (1 + rs))
+        return out.fillna(50.0)
+
+    @staticmethod
+    def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        high, low, close = df["High"], df["Low"], df["Close"]
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+        ).max(axis=1)
+        return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+# ==========================================================================================
+# SECTION 2 : TIME & VOLATILITY FILTER (GOLD KILLZONES)
+# ==========================================================================================
+class KillzoneFilter:
+    @staticmethod
+    def _in_range(t: datetime, start: tuple, end: tuple) -> bool:
+        cur = t.hour * 60 + t.minute
+        s = start[0] * 60 + start[1]
+        e = end[0] * 60 + end[1]
+        return s <= cur <= e
+
+    @classmethod
+    def check(cls, t: datetime = None) -> dict:
+        t = t or now_th()
+        if t.weekday() not in CFG.TRADE_WEEKDAYS:
+            return {"active": False, "zone": "WEEKEND",
+                    "reason": "ตลาดทองคำปิดทำการช่วงเสาร์-อาทิตย์"}
+
+        for kz in CFG.KILLZONES:
+            if cls._in_range(t, kz["start"], kz["end"]):
+                return {"active": True, "zone": kz["name"],
+                        "reason": f"อยู่ในช่วง {kz['name']} "
+                                  f"({kz['start'][0]:02d}:{kz['start'][1]:02d}-"
+                                  f"{kz['end'][0]:02d}:{kz['end'][1]:02d} น.)"}
+
+        return {"active": False, "zone": "WAIT_OUTSIDE_KILLZONE",
+                "reason": f"เวลา {t.strftime('%H:%M')} น. อยู่นอก Killzone "
+                          f"(London 14:00-17:30 / NY 19:30-23:30) — งดเปิดออเดอร์ใหม่"}
+
+    @classmethod
+    def next_killzone_str(cls, t: datetime = None) -> str:
+        t = t or now_th()
+        cands = []
+        for day_offset in range(0, 4):
+            d = t + timedelta(days=day_offset)
+            if d.weekday() not in CFG.TRADE_WEEKDAYS:
+                continue
+            for kz in CFG.KILLZONES:
+                start = d.replace(hour=kz["start"][0], minute=kz["start"][1], second=0, microsecond=0)
+                if start > t:
+                    cands.append((start, kz["name"]))
+        if not cands:
+            return "ไม่ทราบ"
+        cands.sort(key=lambda x: x[0])
+        nxt, name = cands[0]
+        delta = nxt - t
+        hrs = int(delta.total_seconds() // 3600)
+        mins = int((delta.total_seconds() % 3600) // 60)
+        return f"{name} เวลา {nxt.strftime('%d/%m %H:%M')} น. (อีก {hrs} ชม. {mins} นาที)"
+
+
+# ==========================================================================================
+# SECTION 3 : INSTITUTIONAL SMC LOGIC & PRICING ARRAY
+# ==========================================================================================
+class SMCEngine:
+    @staticmethod
+    def swing_points(df: pd.DataFrame, lookback: int) -> dict:
+        seg = df.tail(lookback)
+        sw_high = safe_float(seg["High"].max())
+        sw_low = safe_float(seg["Low"].min())
+        idx_high = seg["High"].idxmax()
+        idx_low = seg["Low"].idxmin()
+        return {
+            "swing_high": sw_high,
+            "swing_low": sw_low,
+            "swing_high_time": idx_high,
+            "swing_low_time": idx_low,
+            "range": max(sw_high - sw_low, 1e-9),
+            "equilibrium": (sw_high + sw_low) / 2.0,
+        }
+
+    @staticmethod
+    def fractal_swings(df: pd.DataFrame, left: int = 2, right: int = 2, lookback: int = 40):
+        seg = df.tail(lookback).reset_index(drop=False)
+        highs, lows = [], []
+        for i in range(left, len(seg) - right):
+            h = seg["High"].iloc[i]
+            l = seg["Low"].iloc[i]
+            is_high = all(h > seg["High"].iloc[i - k] for k in range(1, left + 1)) and \
+                      all(h > seg["High"].iloc[i + k] for k in range(1, right + 1))
+            is_low = all(l < seg["Low"].iloc[i - k] for k in range(1, left + 1)) and \
+                     all(l < seg["Low"].iloc[i + k] for k in range(1, right + 1))
+            if is_high:
+                highs.append({"price": safe_float(h), "idx": i})
+            if is_low:
+                lows.append({"price": safe_float(l), "idx": i})
+        return list(reversed(highs)), list(reversed(lows))
+
+    @classmethod
+    def premium_discount(cls, htf: pd.DataFrame, price: float) -> dict:
+        sw = cls.swing_points(htf, CFG.HTF_SWING_LOOKBACK)
+        pos = (price - sw["swing_low"]) / sw["range"]
+        if pos > 0.5 + CFG.EQ_BUFFER:
+            zone = "PREMIUM"
+        elif pos < 0.5 - CFG.EQ_BUFFER:
+            zone = "DISCOUNT"
+        else:
+            zone = "EQUILIBRIUM"
+        return {
+            **sw,
+            "position_pct": round(pos * 100, 2),
+            "zone": zone,
+            "allow_buy": zone == "DISCOUNT",
+            "allow_sell": zone == "PREMIUM",
+        }
+
+    @classmethod
+    def liquidity_sweep(cls, ltf: pd.DataFrame) -> dict:
+        result = {"bullish_sweep": False, "bearish_sweep": False,
+                  "swept_level": None, "sweep_bars_ago": None, "detail": "ไม่พบการกวาด Liquidity"}
+        if len(ltf) < CFG.LTF_SWING_LOOKBACK + CFG.SWEEP_WINDOW + 5:
+            return result
+
+        hist = ltf.iloc[:-CFG.SWEEP_WINDOW]
+        recent = ltf.tail(CFG.SWEEP_WINDOW)
+
+        highs, lows = cls.fractal_swings(hist, left=2, right=2, lookback=CFG.LTF_SWING_LOOKBACK)
+        ref_high = highs[0]["price"] if highs else safe_float(hist["High"].tail(CFG.LTF_SWING_LOOKBACK).max())
+        ref_low = lows[0]["price"] if lows else safe_float(hist["Low"].tail(CFG.LTF_SWING_LOOKBACK).min())
+
+        for i in range(len(recent)):
+            row = recent.iloc[i]
+            bars_ago = len(recent) - i - 1
+            if row["Low"] < ref_low and row["Close"] > ref_low:
+                result.update({
+                    "bullish_sweep": True, "swept_level": round(ref_low, 2),
+                    "sweep_bars_ago": bars_ago,
+                    "detail": f"กวาด Sell-side Liquidity ใต้ {ref_low:.2f} แล้วปิดกลับเหนือระดับ ({bars_ago} แท่งก่อน)"
+                })
+            if row["High"] > ref_high and row["Close"] < ref_high:
+                result.update({
+                    "bearish_sweep": True, "swept_level": round(ref_high, 2),
+                    "sweep_bars_ago": bars_ago,
+                    "detail": f"กวาด Buy-side Liquidity เหนือ {ref_high:.2f} แล้วปิดกลับใต้ระดับ ({bars_ago} แท่งก่อน)"
+                })
+
+        result["ref_high"] = round(ref_high, 2)
+        result["ref_low"] = round(ref_low, 2)
+        return result
+
+    @classmethod
+    def detect_fvg(cls, ltf: pd.DataFrame, atr_val: float) -> dict:
+        out = {"has_fvg": False, "type": None, "top": None, "bottom": None,
+               "size": 0.0, "tested": False, "bars_ago": None, "detail": "ไม่พบ FVG ที่มีนัยยะ"}
+        if len(ltf) < CFG.FVG_SCAN_BARS + 3:
+            return out
+
+        seg = ltf.tail(CFG.FVG_SCAN_BARS).reset_index(drop=True)
+        price = safe_float(ltf["Close"].iloc[-1])
+        min_size = max(atr_val * CFG.FVG_MIN_SIZE_ATR, 0.30)
+        found = []
+
+        for i in range(len(seg) - 3, -1, -1):
+            c1, c2, c3 = seg.iloc[i], seg.iloc[i + 1], seg.iloc[i + 2]
+            bars_ago = len(seg) - (i + 3)
+
+            # Bullish FVG
+            if c1["High"] < c3["Low"]:
+                bottom, top = safe_float(c1["High"]), safe_float(c3["Low"])
+                size = top - bottom
+                if size >= min_size:
+                    after = seg.iloc[i + 3:]
+                    invalidated = (not after.empty) and (after["Low"].min() < bottom)
+                    tested = bottom <= price <= top or (
+                        (not after.empty) and after["Low"].min() <= top
+                    )
+                    if not invalidated:
+                        found.append({"type": "BULLISH", "top": top, "bottom": bottom,
+                                      "size": size, "tested": bool(tested), "bars_ago": bars_ago})
+
+            # Bearish FVG
+            if c1["Low"] > c3["High"]:
+                top, bottom = safe_float(c1["Low"]), safe_float(c3["High"])
+                size = top - bottom
+                if size >= min_size:
+                    after = seg.iloc[i + 3:]
+                    invalidated = (not after.empty) and (after["High"].max() > top)
+                    tested = bottom <= price <= top or (
+                        (not after.empty) and after["High"].max() >= bottom
+                    )
+                    if not invalidated:
+                        found.append({"type": "BEARISH", "top": top, "bottom": bottom,
+                                      "size": size, "tested": bool(tested), "bars_ago": bars_ago})
+
+            if found:
+                break
+
+        if found:
+            f = found[0]
+            out.update({
+                "has_fvg": True, "type": f["type"],
+                "top": round(f["top"], 2), "bottom": round(f["bottom"], 2),
+                "size": round(f["size"], 2), "tested": f["tested"], "bars_ago": f["bars_ago"],
+                "detail": f"{f['type']} FVG ช่วง {f['bottom']:.2f}-{f['top']:.2f} "
+                          f"({f['size']:.2f} USD) {'[ทดสอบแล้ว]' if f['tested'] else '[ยังไม่ทดสอบ]'}"
+            })
+        return out
+
+    @classmethod
+    def evaluate(cls, htf: pd.DataFrame, ltf: pd.DataFrame) -> dict:
+        price = safe_float(ltf["Close"].iloc[-1])
+
+        htf = htf.copy()
+        htf["EMA200"] = Indicators.ema(htf["Close"], CFG.EMA_PERIOD)
+        htf["ATR"] = Indicators.atr(htf, CFG.ATR_PERIOD)
+        ema200_h1 = safe_float(htf["EMA200"].iloc[-1], price)
+        htf_close = safe_float(htf["Close"].iloc[-1], price)
+        htf_bias = "BULLISH" if htf_close > ema200_h1 else "BEARISH"
+        htf_atr = safe_float(htf["ATR"].iloc[-1], 1.0)
+
+        ltf = ltf.copy()
+        ltf["RSI"] = Indicators.rsi(ltf["Close"], CFG.RSI_PERIOD)
+        ltf["ATR"] = Indicators.atr(ltf, CFG.ATR_PERIOD)
+        rsi = safe_float(ltf["RSI"].iloc[-1], 50.0)
+        atr = safe_float(ltf["ATR"].iloc[-1], 1.0)
+
+        pd_arr = cls.premium_discount(htf, price)
+        sweep = cls.liquidity_sweep(ltf)
+        fvg = cls.detect_fvg(ltf, atr)
+
+        ctx = {
+            "price": round(price, 2),
+            "htf_bias": htf_bias,
+            "htf_ema200": round(ema200_h1, 2),
+            "htf_close": round(htf_close, 2),
+            "htf_atr": round(htf_atr, 2),
+            "ltf_rsi": round(rsi, 2),
+            "ltf_atr": round(atr, 2),
+            "pd_array": pd_arr,
+            "sweep": sweep,
+            "fvg": fvg,
+            "checks": {},
+            "direction": "NONE",
+            "reject_reasons": [],
+        }
+
+        buy_checks = {
+            "discount_zone": pd_arr["allow_buy"],
+            "liquidity_swept_low": sweep["bullish_sweep"],
+            "bullish_fvg_tested": fvg["has_fvg"] and fvg["type"] == "BULLISH" and fvg["tested"],
+            "htf_bias_ok": htf_bias == "BULLISH",
+            "rsi_ok": CFG.RSI_BUY_RANGE[0] <= rsi <= CFG.RSI_BUY_RANGE[1],
+        }
+
+        sell_checks = {
+            "premium_zone": pd_arr["allow_sell"],
+            "liquidity_swept_high": sweep["bearish_sweep"],
+            "bearish_fvg_tested": fvg["has_fvg"] and fvg["type"] == "BEARISH" and fvg["tested"],
+            "htf_bias_ok": htf_bias == "BEARISH",
+            "rsi_ok": CFG.RSI_SELL_RANGE[0] <= rsi <= CFG.RSI_SELL_RANGE[1],
+        }
+
+        buy_score = sum(1 for v in buy_checks.values() if v)
+        sell_score = sum(1 for v in sell_checks.values() if v)
+
+        if all(buy_checks.values()):
+            ctx["direction"] = "BUY"
+            ctx["checks"] = buy_checks
+        elif all(sell_checks.values()):
+            ctx["direction"] = "SELL"
+            ctx["checks"] = sell_checks
+        else:
+            ctx["checks"] = {"buy": buy_checks, "sell": sell_checks}
+            side = "BUY" if buy_score >= sell_score else "SELL"
+            failed = [k for k, v in (buy_checks if side == "BUY" else sell_checks).items() if not v]
+            ctx["reject_reasons"] = failed
+            ctx["best_side"] = side
+            ctx["best_score"] = f"{max(buy_score, sell_score)}/5"
+
+        return ctx
+
+
+# ==========================================================================================
+# SECTION 4 : NEWS BLACKOUT ENGINE
+# ==========================================================================================
+class NewsBlackoutEngine:
+    def __init__(self):
+        self.events = []
+        self.last_fetch = 0.0
+        self.lock = threading.Lock()
+
+    def fetch(self, force: bool = False) -> None:
+        if not force and (time.time() - self.last_fetch) < CFG.NEWS_REFRESH_SEC and self.events:
+            return
+        try:
+            r = requests.get(
+                CFG.FF_CALENDAR_URL, timeout=25,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; SMC-GoldBot/1.0)"}
+            )
+            r.raise_for_status()
+            raw = r.json()
+            parsed = []
+            for ev in raw:
+                country = str(ev.get("country", "")).upper()
+                impact = str(ev.get("impact", "")).lower()
+                if country != "USD" or impact != "high":
+                    continue
+                dt_str = ev.get("date")
+                if not dt_str:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                parsed.append({
+                    "title": ev.get("title", "Unknown"),
+                    "time": dt.astimezone(CFG.TZ),
+                    "forecast": ev.get("forecast", ""),
+                    "previous": ev.get("previous", ""),
+                })
+            parsed.sort(key=lambda x: x["time"])
+            with self.lock:
+                self.events = parsed
+                self.last_fetch = time.time()
+            log.info(f"[News] โหลดข่าว USD High Impact สำเร็จ {len(parsed)} รายการ")
+        except Exception as e:
+            log.warning(f"[News] ดึงปฏิทินข่าวไม่สำเร็จ: {e}")
+
+    def check_blackout(self, t: datetime = None) -> dict:
+        t = t or now_th()
+        self.fetch()
+        with self.lock:
+            evs = list(self.events)
+
+        for ev in evs:
+            start = ev["time"] - timedelta(minutes=CFG.NEWS_BLACKOUT_BEFORE_MIN)
+            end = ev["time"] + timedelta(minutes=CFG.NEWS_BLACKOUT_AFTER_MIN)
+            if start <= t <= end:
+                return {
+                    "blackout": True,
+                    "event": ev["title"],
+                    "event_time": ev["time"],
+                    "reason": f"อยู่ในช่วง News Blackout: {ev['title']} "
+                              f"เวลา {ev['time'].strftime('%d/%m %H:%M')} น. (±{CFG.NEWS_BLACKOUT_BEFORE_MIN} นาที)"
+                }
+        return {"blackout": False, "event": None, "event_time": None, "reason": "ไม่มีข่าวแรงในช่วงนี้"}
+
+    def next_event(self, t: datetime = None) -> dict:
+        t = t or now_th()
+        self.fetch()
+        with self.lock:
+            for ev in self.events:
+                if ev["time"] > t:
+                    mins = int((ev["time"] - t).total_seconds() // 60)
+                    return {"title": ev["title"], "time": ev["time"], "minutes_away": mins}
+        return {"title": None, "time": None, "minutes_away": None}
+
+
+# ==========================================================================================
+# SECTION 5 : ADVANCED AI BRAIN (GEMINI REST + CLAUDE + FALLBACK)
+# ==========================================================================================
+class AIBrain:
+    SYSTEM_PROMPT = """You are an institutional Smart Money Concepts (SMC) quantitative trader and risk officer for Spot Gold (XAUUSD).
+Validate the technical setup strictly and return ONLY a valid JSON object (no markdown fences, no other text):
+{
+  "decision": "BUY" | "SELL" | "WAIT",
+  "confidence": <integer 0-100>,
+  "entry": <float>,
+  "stop_loss": <float>,
+  "take_profit": <float>,
+  "risk_reward": <float>,
+  "liquidity_narrative": "<1-2 sentences in Thai or English explaining the liquidity sweep>",
+  "structure_reason": "<1-2 sentences explaining structural SL placement>",
+  "reasoning_th": "<สรุปเหตุผลกระชับเป็นภาษาไทย 2 ประโยค>",
+  "invalidation": "<เงื่อนไขยกเลิกไอเดีย>"
+}"""
+
+    def __init__(self):
+        self.provider = CFG.AI_PROVIDER
+        self.enabled = (
+            (self.provider == "gemini" and bool(CFG.GEMINI_API_KEY)) or
+            (self.provider == "claude" and bool(CFG.CLAUDE_API_KEY))
+        )
+        if not self.enabled:
+            log.warning("[AI] ไม่พบ API Key สำหรับ AI — ระบบจะใช้ Fallback Quant Engine อัตโนมัติ")
+
+    @staticmethod
+    def build_payload(ctx: dict, kz: dict, news_next: dict) -> dict:
+        return {
+            "symbol": "XAUUSD (Spot Gold via PAXG-USD)",
+            "timestamp_bangkok": fmt_th(now_th()),
+            "current_price": ctx["price"],
+            "proposed_direction": ctx["direction"],
+            "higher_timeframe_H1": {
+                "bias": ctx["htf_bias"],
+                "ema200": ctx["htf_ema200"],
+                "close": ctx["htf_close"],
+                "atr": ctx["htf_atr"],
+                "swing_high_20": round(ctx["pd_array"]["swing_high"], 2),
+                "swing_low_20": round(ctx["pd_array"]["swing_low"], 2),
+                "equilibrium_50pct": round(ctx["pd_array"]["equilibrium"], 2),
+            },
+            "premium_discount_array": {
+                "zone": ctx["pd_array"]["zone"],
+                "position_in_range_pct": ctx["pd_array"]["position_pct"],
+            },
+            "liquidity_sweep": ctx["sweep"],
+            "fair_value_gap_M15": ctx["fvg"],
+            "momentum": {
+                "rsi14_M15": ctx["ltf_rsi"],
+                "atr14_M15": ctx["ltf_atr"],
+            },
+            "session": kz,
+            "nearest_high_impact_news": news_next,
+            "constraints": {"minimum_risk_reward": CFG.MIN_RR},
+        }
+
+    def _call_gemini(self, payload: dict) -> str:
+        # ลองโมเดล gemini-2.5-flash ก่อน หากไม่สำเร็จให้ fallback ไปที่ gemini-1.5-flash
+        models = [CFG.GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash"]
+        last_e = None
+        for m in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={CFG.GEMINI_API_KEY}"
+            body = {
+                "system_instruction": {"parts": [{"text": self.SYSTEM_PROMPT}]},
+                "contents": [{
+                    "role": "user",
+                    "parts": [{"text": "Analyse setup and return JSON:\n" + json.dumps(payload, ensure_ascii=False)}]
+                }],
+                "generationConfig": {
+                    "temperature": 0.15,
+                    "maxOutputTokens": 1000,
+                    "responseMimeType": "application/json",
+                },
+            }
+            try:
+                r = requests.post(url, json=body, timeout=CFG.AI_TIMEOUT)
+                r.raise_for_status()
+                data = r.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except Exception as e:
+                last_e = e
+                continue
+        raise RuntimeError(f"Gemini API ล้มเหลวทุกโมเดล: {last_e}")
+
+    def _call_claude(self, payload: dict) -> str:
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": CFG.CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        body = {
+            "model": CFG.CLAUDE_MODEL,
+            "max_tokens": 1000,
+            "temperature": 0.15,
+            "system": self.SYSTEM_PROMPT,
+            "messages": [{
+                "role": "user",
+                "content": "Analyse setup and return JSON:\n" + json.dumps(payload, ensure_ascii=False)
+            }],
+        }
+        r = requests.post(url, headers=headers, json=body, timeout=CFG.AI_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        return "".join(blk.get("text", "") for blk in data.get("content", []))
+
+    @staticmethod
+    def _extract_json(text: str) -> dict:
+        t = text.strip()
+        if "```" in t:
+            parts = t.split("```")
+            for p in parts:
+                p = p.strip()
+                if p.startswith("json"):
+                    p = p[4:].strip()
+                if p.startswith("{"):
+                    t = p
+                    break
+        s, e = t.find("{"), t.rfind("}")
+        if s == -1 or e == -1:
+            raise ValueError("ไม่พบ JSON ในคำตอบ")
+        return json.loads(t[s:e + 1])
+
+    def validate(self, ctx: dict, kz: dict, news_next: dict) -> dict:
+        payload = self.build_payload(ctx, kz, news_next)
+        if not self.enabled:
+            return FallbackEngine.decide(ctx, reason="ไม่ได้เปิดใช้งาน AI API")
+
+        try:
+            raw = self._call_gemini(payload) if self.provider == "gemini" else self._call_claude(payload)
+            res = self._extract_json(raw)
+
+            decision = str(res.get("decision", "WAIT")).upper()
+            if decision not in ("BUY", "SELL"):
+                return {"decision": "WAIT", "source": f"AI({self.provider})",
+                        "reasoning_th": res.get("reasoning_th", "AI ประเมินว่ากราฟยังไม่ชัดเจน"),
+                        "liquidity_narrative": res.get("liquidity_narrative", ""),
+                        "confidence": int(safe_float(res.get("confidence", 0)))}
+
+            entry = safe_float(res.get("entry"), ctx["price"])
+            sl = safe_float(res.get("stop_loss"))
+            tp = safe_float(res.get("take_profit"))
+
+            valid = True
+            if decision == "BUY" and not (sl < entry < tp):
+                valid = False
+            if decision == "SELL" and not (tp < entry < sl):
+                valid = False
+
+            if not valid or sl <= 0 or tp <= 0:
+                log.warning("[AI] ค่า SL/TP ผิดตรรกะ → สลับไปใช้ Fallback")
+                return FallbackEngine.decide(ctx, reason="AI ส่งค่า SL/TP ผิดตรรกะ")
+
+            risk = abs(entry - sl)
+            reward = abs(tp - entry)
+            rr = reward / risk if risk > 0 else 0.0
+
+            if rr < CFG.MIN_RR:
+                return {"decision": "WAIT", "source": f"AI({self.provider})",
+                        "reasoning_th": f"R:R 1:{rr:.2f} ต่ำกว่าเกณฑ์ขั้นต่ำ 1:{CFG.MIN_RR}",
+                        "confidence": int(safe_float(res.get("confidence", 0)))}
+
+            return {
+                "decision": decision,
+                "source": f"AI({self.provider})",
+                "entry": round(entry, 2),
+                "stop_loss": round(sl, 2),
+                "take_profit": round(tp, 2),
+                "risk_reward": round(rr, 2),
+                "confidence": int(safe_float(res.get("confidence", 75))),
+                "liquidity_narrative": res.get("liquidity_narrative", ""),
+                "structure_reason": res.get("structure_reason", ""),
+                "reasoning_th": res.get("reasoning_th", ""),
+                "invalidation": res.get("invalidation", ""),
+            }
+        except Exception as e:
+            log.error(f"[AI] เรียก API ล้มเหลว: {e} → ใช้ Fallback Quant")
+            return FallbackEngine.decide(ctx, reason=f"AI ขัดข้อง ({type(e).__name__})")
+
+
+# ==========================================================================================
+# SECTION 5.1 : FALLBACK QUANT ENGINE
+# ==========================================================================================
+class FallbackEngine:
+    @staticmethod
+    def decide(ctx: dict, reason: str = "") -> dict:
+        direction = ctx.get("direction", "NONE")
+        if direction not in ("BUY", "SELL"):
+            return {"decision": "WAIT", "source": "FallbackQuant",
+                    "reasoning_th": "ไม่มีทิศทางที่ผ่านเกณฑ์ Confluence"}
+
+        entry = ctx["price"]
+        atr = max(ctx["ltf_atr"], 0.5)
+        buffer = CFG.SL_ATR_BUFFER * atr
+
+        if direction == "BUY":
+            struct = ctx["sweep"].get("swept_level") or ctx["sweep"].get("ref_low") or (entry - 2 * atr)
+            fvg_bot = ctx["fvg"].get("bottom")
+            if fvg_bot:
+                struct = min(struct, fvg_bot)
+            sl = struct - buffer
+            risk = entry - sl
+            if risk <= 0:
+                sl = entry - (2.0 * atr)
+                risk = entry - sl
+            tp = entry + (risk * CFG.MIN_RR)
+        else:
+            struct = ctx["sweep"].get("swept_level") or ctx["sweep"].get("ref_high") or (entry + 2 * atr)
+            fvg_top = ctx["fvg"].get("top")
+            if fvg_top:
+                struct = max(struct, fvg_top)
+            sl = struct + buffer
+            risk = sl - entry
+            if risk <= 0:
+                sl = entry + (2.0 * atr)
+                risk = sl - entry
+            tp = entry - (risk * CFG.MIN_RR)
+
+        rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
+
+        return {
+            "decision": direction,
+            "source": "FallbackQuant",
+            "entry": round(entry, 2),
+            "stop_loss": round(sl, 2),
+            "take_profit": round(tp, 2),
+            "risk_reward": round(rr, 2),
+            "confidence": 65,
+            "liquidity_narrative": ctx["sweep"]["detail"],
+            "structure_reason": f"SL วางนอกโครงสร้าง Swing ที่ {struct:.2f} เผื่อ {CFG.SL_ATR_BUFFER}×ATR",
+            "reasoning_th": f"[โหมดสำรอง] {reason} — คำนวณด้วย Quant SMC Rule (R:R 1:{rr:.2f})",
+            "invalidation": f"แท่ง M15 ปิด{'ต่ำกว่า' if direction=='BUY' else 'สูงกว่า'} {sl:.2f}",
+        }
+
+
+# ==========================================================================================
+# SECTION 6.1 : PERFORMANCE TRACKER
+# ==========================================================================================
+class PerformanceTracker:
+    DEFAULT = {
+        "wins": 0, "losses": 0, "total": 0, "win_rate": 0.0,
+        "total_points": 0.0, "total_pips": 0.0,
+        "best_trade_points": 0.0, "worst_trade_points": 0.0,
+        "buy_signals": 0, "sell_signals": 0,
+        "started_at": None, "last_updated": None, "history": [],
+    }
+
+    def __init__(self, path: str = None):
+        self.path = path or CFG.STATS_FILE
+        self.data = self._load()
+
+    def _load(self) -> dict:
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                for k, v in self.DEFAULT.items():
+                    d.setdefault(k, v)
+                return d
+        except Exception as e:
+            log.warning(f"[Stats] อ่านไฟล์สถิติไม่สำเร็จ: {e}")
+        d = dict(self.DEFAULT)
+        d["started_at"] = fmt_th(now_th())
+        return d
+
+    def save(self) -> None:
+        with FILE_LOCK:
+            try:
+                self.data["last_updated"] = fmt_th(now_th())
+                with open(self.path, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                log.error(f"[Stats] บันทึกไฟล์ไม่สำเร็จ: {e}")
+
+    def record_signal(self, direction: str) -> None:
+        if direction == "BUY":
+            self.data["buy_signals"] += 1
+        elif direction == "SELL":
+            self.data["sell_signals"] += 1
+        self.save()
+
+    def record_result(self, trade: dict, result: str, points: float) -> None:
+        if result == "TP":
+            self.data["wins"] += 1
+        else:
+            self.data["losses"] += 1
+        self.data["total"] += 1
+        self.data["total_points"] += points
+        self.data["total_pips"] += points / 10.0
+        self.data["best_trade_points"] = max(self.data["best_trade_points"], points)
+        self.data["worst_trade_points"] = min(self.data["worst_trade_points"], points)
+        self.data["win_rate"] = round(
+            (self.data["wins"] / self.data["total"]) * 100, 2
+        ) if self.data["total"] else 0.0
+
+        self.data["history"].append({
+            "id": trade.get("id"),
+            "direction": trade.get("direction"),
+            "entry": trade.get("entry"),
+            "exit": trade.get("take_profit") if result == "TP" else trade.get("stop_loss"),
+            "result": result,
+            "points": round(points, 1),
+            "pips": round(points / 10.0, 1),
+            "closed_at": fmt_th(now_th()),
+        })
+        self.data["history"] = self.data["history"][-100:]
+        self.save()
+
+    def summary(self) -> str:
+        d = self.data
+        return (f"✅ ชนะ: **{d['wins']}** | ❌ แพ้: **{d['losses']}** | รวม: **{d['total']}** ไม้\n"
+                f"🎯 Win Rate: **{d['win_rate']}%** | กำไรสะสม: **{d['total_points']:+.1f} pts**")
+
+
+# ==========================================================================================
+# SECTION 6.2 : DISCORD NOTIFIER
+# ==========================================================================================
+class DiscordNotifier:
+    COLOR_BUY = 0x00F0FF
+    COLOR_SELL = 0xFF0055
+    COLOR_INFO = 0x5865F2
+    COLOR_TP = 0x00FFA3
+    COLOR_SL = 0xFF2A6D
+
+    def __init__(self, webhook: str = None):
+        self.webhook = webhook or CFG.DISCORD_WEBHOOK
+        if not self.webhook:
+            log.warning("[Discord] ไม่พบ Webhook URL — จะแสดงในคอนโซลแทน")
+
+    def _post(self, embed: dict, content: str = "") -> bool:
+        if not self.webhook:
+            return False
+        body = {"embeds": [embed]}
+        if content:
+            body["content"] = content
+        for attempt in range(3):
+            try:
+                r = requests.post(self.webhook, json=body, timeout=12)
+                if r.status_code in (200, 204):
+                    return True
+                if r.status_code == 429:
+                    wait = safe_float(r.json().get("retry_after", 3), 3)
+                    time.sleep(wait + 1)
+                    continue
+            except Exception:
+                pass
+            time.sleep(2)
+        return False
+
+    def send_signal(self, trade: dict, ctx: dict, ai: dict, kz: dict, news_next: dict) -> None:
+        is_buy = trade["direction"] == "BUY"
+        emoji = "🟢 BUY LONG" if is_buy else "🔴 SELL SHORT"
+        color = self.COLOR_BUY if is_buy else self.COLOR_SELL
+
+        risk_pts = abs(trade["entry"] - trade["stop_loss"]) / CFG.POINT_VALUE
+        reward_pts = abs(trade["take_profit"] - trade["entry"]) / CFG.POINT_VALUE
+
+        news_txt = "ไม่มีข่าวแรงในระยะใกล้"
+        if news_next.get("title"):
+            news_txt = f"{news_next['title']} (อีก {news_next['minutes_away']} นาที)"
+
+        embed = {
+            "title": f"⚡ {emoji} // XAUUSD INSTITUTIONAL SETUP",
+            "description": (f"**กลยุทธ์:** `SMC + Killzone + AI Validation`\n"
+                            f"**เหตุผล:** {ai.get('reasoning_th', '-')}\n"
+                            f"**ระดับความมั่นใจ:** `{ai.get('confidence', '-')}%` ({ai.get('source', '-')})"),
+            "color": color,
+            "fields": [
+                {
+                    "name": "🎯 แผนราคา Spot Gold (Parameters)",
+                    "value": (f"```yaml\n"
+                              f"ENTRY : {trade['entry']:.2f}\n"
+                              f"SL    : {trade['stop_loss']:.2f} (-{risk_pts/100:.1f} pts)\n"
+                              f"TP    : {trade['take_profit']:.2f} (+{reward_pts/100:.1f} pts)\n"
+                              f"R:R   : 1:{trade['risk_reward']:.1f}\n"
+                              f"```"),
+                    "inline": False
+                },
+                {
+                    "name": "🏛️ สภาพคล่อง & โซนราคา (SMC Context)",
+                    "value": (f"• **H1 Bias:** `{ctx['htf_bias']}` (เหนือ EMA200: {ctx['htf_ema200']:.2f})\n"
+                              f"• **โซนสวิง:** `{ctx['pd_array']['zone']}` ({ctx['pd_array']['position_pct']:.1f}%)\n"
+                              f"• **การกวาด:** {ctx['sweep']['detail']}\n"
+                              f"• **FVG:** {ctx['fvg']['detail']}"),
+                    "inline": False
+                },
+                {
+                    "name": "🕐 Session & News",
+                    "value": f"Killzone: **{kz['zone']}** │ ข่าว USD: `{news_txt}`",
+                    "inline": False
+                }
+            ],
+            "footer": {"text": "Spot Gold Quantitative Alpha • Asia/Bangkok"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._post(embed, content="@here 📢 **พบสัญญาณเทรดทองคำระดับสถาบัน**")
+
+    def send_close(self, trade: dict, result: str, points: float, stats: PerformanceTracker) -> None:
+        win = result == "TP"
+        title = "🎯 [PROFIT LOCKED // TAKE PROFIT]" if win else "🛑 [STOP LOSS // RISK MITIGATED]"
+        color = self.COLOR_TP if win else self.COLOR_SL
+        exit_price = trade["take_profit"] if win else trade["stop_loss"]
+
+        embed = {
+            "title": title,
+            "description": f"```diff\n{'+' if win else '-'} RESULT: {result} ({trade['direction']} ORDER)\n"
+                            f"{'+' if win else '-'} PnL: {points:+.2f} PTS ({points/10:+.1f} PIPS)\n```",
+            "color": color,
+            "fields": [
+                {"name": "จุดเข้า", "value": f"`{trade['entry']:.2f}`", "inline": True},
+                {"name": "จุดปิด", "value": f"`{exit_price:.2f}`", "inline": True},
+                {"name": "ถือครอง", "value": trade.get("duration", "-"), "inline": True},
+                {"name": "📊 สถิติระบบสะสม", "value": stats.summary(), "inline": False},
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._post(embed)
+
+    def send_startup(self, stats: PerformanceTracker) -> None:
+        embed = {
+            "title": "🟢 BOT ONLINE // INSTITUTIONAL SMC SYSTEM",
+            "description": (">>> **ระบบเทรดทองคำระดับสถาบัน (Spot Gold) เริ่มทำงานแล้ว!**\n"
+                            "• **สถาปัตยกรรม:** Dual-Timeframe (H1 Bias + M15 Execution)\n"
+                            "• **ตัวกรอง:** Killzones + Premium/Discount + News Blackout\n"
+                            "• **AI Brain:** Multi-Agent Chain-of-Thought Validation"),
+            "color": 0x00FF88,
+            "fields": [
+                {"name": "🎯 Killzones", "value": "London (14:00-17:30) │ NY (19:30-23:30)", "inline": True},
+                {"name": "⚖️ Min R:R", "value": f"1 : {CFG.MIN_RR}", "inline": True},
+                {"name": "📊 สถิติเดิม", "value": stats.summary(), "inline": False},
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._post(embed)
+
+    def send_heartbeat(self, stats: PerformanceTracker, price: float, kz: dict, active_trades: list) -> None:
+        embed = {
+            "title": "💓 HEARTBEAT // BOT IS ACTIVE & WATCHING",
+            "description": (f">>> 📡 **สถานะ:** กำลังเฝ้าตลาดตามรอบปกติ\n"
+                            f"💰 **Spot Gold ล่าสุด:** `{price:.2f}`\n"
+                            f"🎯 **Killzone ปัจจุบัน:** `{kz['zone']}`\n"
+                            f"📌 **ไม้ที่เปิดอยู่:** `{len(active_trades)} ไม้`\n\n"
+                            f"{stats.summary()}"),
+            "color": self.COLOR_INFO,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._post(embed)
+
+    def send_alert(self, title: str, msg: str) -> None:
+        self._post({
+            "title": title,
+            "description": msg[:1800],
+            "color": 0xF39C12,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+
+# ==========================================================================================
+# SECTION 6.3 : TRADE MANAGER
+# ==========================================================================================
+class TradeManager:
+    def __init__(self, notifier: DiscordNotifier, stats: PerformanceTracker):
+        self.notifier = notifier
+        self.stats = stats
+        self.path = CFG.TRADES_FILE
+        self.trades = self._load()
+        self.last_signal_time = None
+
+    def _load(self) -> list:
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return []
+
+    def _save(self) -> None:
+        with FILE_LOCK:
+            try:
+                with open(self.path, "w", encoding="utf-8") as f:
+                    json.dump(self.trades, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                log.error(f"[Trades] บันทึกไม่สำเร็จ: {e}")
+
+    def can_open(self) -> tuple:
+        if len(self.trades) >= CFG.MAX_CONCURRENT_TRADES:
+            return False, f"มีไม้เปิดอยู่ครบ {CFG.MAX_CONCURRENT_TRADES} ไม้แล้ว"
+        if self.last_signal_time:
+            elapsed = (now_th() - self.last_signal_time).total_seconds() / 60
+            if elapsed < CFG.SIGNAL_COOLDOWN_MIN:
+                return False, f"อยู่ใน Cooldown (เหลือ {CFG.SIGNAL_COOLDOWN_MIN - elapsed:.0f} นาที)"
+        return True, "พร้อมเปิดไม้ใหม่"
+
+    def open_trade(self, ai: dict, ctx: dict, kz: dict, news_next: dict) -> dict:
+        tid = f"XAU-{now_th().strftime('%y%m%d-%H%M%S')}"
+        trade = {
+            "id": tid,
+            "direction": ai["decision"],
+            "entry": ai["entry"],
+            "stop_loss": ai["stop_loss"],
+            "take_profit": ai["take_profit"],
+            "risk_reward": ai["risk_reward"],
+            "opened_at": fmt_th(now_th()),
+            "opened_ts": now_th().timestamp(),
+            "killzone": kz["zone"],
+            "htf_bias": ctx["htf_bias"],
+            "source": ai.get("source", "-"),
+            "status": "OPEN",
+        }
+        self.trades.append(trade)
+        self.last_signal_time = now_th()
+        self._save()
+        self.stats.record_signal(trade["direction"])
+        self.notifier.send_signal(trade, ctx, ai, kz, news_next)
+        log.info(f"[Trade] เปิดไม้ใหม่ {tid} {trade['direction']} @ {trade['entry']:.2f}")
+        return trade
+
+    def monitor(self, price: float) -> None:
+        if not self.trades or price <= 0:
+            return
+        remaining = []
+        for t in self.trades:
+            closed, result = False, None
+            if t["direction"] == "BUY":
+                if price >= t["take_profit"]:
+                    closed, result = True, "TP"
+                elif price <= t["stop_loss"]:
+                    closed, result = True, "SL"
+            else:
+                if price <= t["take_profit"]:
+                    closed, result = True, "TP"
+                elif price >= t["stop_loss"]:
+                    closed, result = True, "SL"
+
+            if closed:
+                exit_price = t["take_profit"] if result == "TP" else t["stop_loss"]
+                diff = (exit_price - t["entry"]) if t["direction"] == "BUY" else (t["entry"] - exit_price)
+                points = diff / CFG.POINT_VALUE
+                held = now_th().timestamp() - t.get("opened_ts", now_th().timestamp())
+                t["duration"] = f"{int(held // 3600)} ชม. {int((held % 3600) // 60)} นาที"
+
+                self.stats.record_result(t, result, points)
+                self.notifier.send_close(t, result, points, self.stats)
+                log.info(f"[Trade] ปิดไม้ {t['id']} {result} ({points:+.1f} pts)")
+            else:
+                remaining.append(t)
+
+        if len(remaining) != len(self.trades):
+            self.trades = remaining
+            self._save()
+
+
+# ==========================================================================================
+# SECTION 6.4 : KEEP-ALIVE WEB SERVER
+# ==========================================================================================
+BOT_STATE = {
+    "status": "starting",
+    "started_at": fmt_th(now_th()),
+    "last_scan": None,
+    "scan_count": 0,
+    "last_price": 0.0,
+    "killzone": "-",
+    "active_trades": 0,
 }
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+class HealthHandler(BaseHTTPRequestHandler):
+    def _send(self, code: int, body: bytes, ctype: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
-active_order = None
-last_news_check_date = None
-last_heartbeat_time = 0
-
-def load_performance_stats():
-    """โหลดสถิติจากไฟล์ JSON หากไม่มีให้สร้างใหม่"""
-    if os.path.exists(CONFIG["STATS_FILE"]):
+    def do_GET(self):
+        path = self.path.split("?")[0].rstrip("/") or "/"
         try:
-            with open(CONFIG["STATS_FILE"], "r", encoding="utf-8") as f:
-                stats = json.load(f)
-                logging.info(f"โหลดสถิติเดิมสำเร็จ: {stats}")
-                return stats
-        except Exception as e:
-            logging.error(f"อ่านไฟล์สถิติไม่สำเร็จ: {e}")
-    return {"wins": 0, "losses": 0, "total": 0}
+            if path in ("/health", "/ping"):
+                self._send(200, b"OK", "text/plain; charset=utf-8")
+            elif path in ("/status", "/stats"):
+                body = json.dumps(BOT_STATE, ensure_ascii=False, indent=2).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+            else:
+                html = f"""<!doctype html><html><head><meta charset="utf-8"><title>SMC Gold Bot</title>
+<style>body{{background:#0d1117;color:#e6edf3;font-family:sans-serif;padding:30px}}
+.card{{background:#161b22;padding:20px;border-radius:10px;max-width:500px;margin:auto}}</style></head>
+<body><div class="card"><h2>🥇 Spot Gold SMC Quant Bot</h2>
+<p>Status: <b>{BOT_STATE['status'].upper()}</b></p>
+<p>Last Price: <b>${BOT_STATE['last_price']:.2f}</b></p>
+<p>Killzone: <b>{BOT_STATE['killzone']}</b></p>
+<p>Scans: <b>{BOT_STATE['scan_count']}</b></p>
+</div></body></html>"""
+                self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
+        except Exception:
+            self._send(500, b"ERROR", "text/plain; charset=utf-8")
 
-def save_performance_stats(stats):
-    """บันทึกสถิติลงไฟล์ JSON ทันทีเมื่อมีการปิดออเดอร์"""
-    try:
-        with open(CONFIG["STATS_FILE"], "w", encoding="utf-8") as f:
-            json.dump(stats, f, indent=4)
-        logging.info("บันทึกสถิติลงไฟล์สำเร็จ")
-    except Exception as e:
-        logging.error(f"บันทึกไฟล์สถิติไม่สำเร็จ: {e}")
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
 
-performance_stats = load_performance_stats()
-
-def send_discord_message(embed_data):
-    """ส่งข้อความ Embed แจ้งเตือนเข้า Discord Webhook โดยใช้รูปและชื่อโปรไฟล์ที่ตั้งไว้ใน Discord โดยตรง"""
-    if not DISCORD_WEBHOOK_URL:
-        logging.warning("ไม่พบ DISCORD_WEBHOOK_URL")
-        return
-    try:
-        payload = {
-            "embeds": [embed_data]
-        }
-        res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        res.raise_for_status()
-    except Exception as e:
-        logging.error(f"ส่ง Discord ไม่สำเร็จ: {e}")
-
-def send_startup_alert():
-    """แจ้งเตือนเข้า Discord ทันทีที่เซิร์ฟเวอร์สตาร์ท เพื่อยืนยันว่าระบบออนไลน์แล้ว"""
-    embed = {
-        "title": "🟢 BOT ONLINE // SYSTEM INITIALIZED",
-        "description": (
-            ">>> **ระบบเทรดอัจฉริยะ SMC + Confluence เริ่มทำงานแล้ว!**\n"
-            "• **สินทรัพย์:** Spot Gold (XAUUSD)\n"
-            "• **ไทม์เฟรม:** M15 (สแกนแท่งเทียนทุก 5 นาที)\n"
-            "• **สถานะ Uptime:** เชื่อมต่อเรียบร้อย เฝ้าตลาด 24 ชม."
-        ),
-        "color": 0x00FF88,
-        "footer": {
-            "text": "Spot Gold Engine Active • Live Monitoring",
-            "icon_url": "https://cdn-icons-png.flaticon.com/512/1006/1006771.png"
-        },
-        "timestamp": datetime.now(pytz.utc).isoformat()
-    }
-    send_discord_message(embed)
-    logging.info("ส่งข้อความ Startup เข้า Discord สำเร็จ")
-
-def send_heartbeat_status(current_price):
-    """ส่งรายงานสถานะบอทยังตื่นอยู่พร้อมราคาปัจจุบันทุกๆ 3 ชม."""
-    global last_heartbeat_time
-    now = time.time()
-    if now - last_heartbeat_time < CONFIG["HEARTBEAT_INTERVAL_SEC"]:
+    def log_message(self, *args):
         return
 
-    win_rate = (performance_stats["wins"] / performance_stats["total"] * 100) if performance_stats["total"] > 0 else 0.0
-    embed = {
-        "title": "💓 HEARTBEAT // BOT IS ACTIVE & WATCHING",
-        "description": (
-            f">>> 📡 **สถานะ:** กำลังเฝ้าโครงสร้างราคาตามปกติ\n"
-            f"💰 **Spot Gold ล่าสุด:** `{current_price:.2f}`\n"
-            f"📊 **Win Rate รวม:** `{win_rate:.1f}%` (ชนะ {performance_stats['wins']} / แพ้ {performance_stats['losses']})"
-        ),
-        "color": 0x5865F2,
-        "footer": {
-            "text": "Every 3 Hours Heartbeat • System Healthy",
-            "icon_url": "https://cdn-icons-png.flaticon.com/512/2972/2972531.png"
-        },
-        "timestamp": datetime.now(pytz.utc).isoformat()
-    }
-    send_discord_message(embed)
-    last_heartbeat_time = now
-    logging.info("ส่งข้อความ Heartbeat ประจำรอบเข้า Discord สำเร็จ")
 
-def check_and_send_thai_forex_news():
-    """ดึงข่าว Forex Factory ประจำวัน แปลงเวลาเป็นเวลาไทย (GMT+7) และแจ้งเตือนอัตโนมัติ"""
-    global last_news_check_date
-    tz_th = pytz.timezone("Asia/Bangkok")
-    now_th = datetime.now(tz_th)
-    today_str = now_th.strftime("%Y-%m-%d")
+def start_web_server() -> None:
+    def _run():
+        while True:
+            try:
+                srv = HTTPServer(("0.0.0.0", CFG.PORT), HealthHandler)
+                log.info(f"[Web] Keep-Alive Server พร้อมทำงานที่พอร์ต {CFG.PORT}")
+                srv.serve_forever()
+            except Exception as e:
+                log.error(f"[Web] Server ขัดข้อง: {e}")
+                time.sleep(10)
 
-    if last_news_check_date == today_str:
-        return
+    threading.Thread(target=_run, daemon=True, name="WebServer").start()
 
-    try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        res = requests.get(url, timeout=10)
-        if res.status_code != 200:
+
+# ==========================================================================================
+# SECTION 7 : MAIN ORCHESTRATOR
+# ==========================================================================================
+class GoldSMCBot:
+    def __init__(self):
+        self.feed = MarketDataFeed()
+        self.news = NewsBlackoutEngine()
+        self.ai = AIBrain()
+        self.stats = PerformanceTracker()
+        self.notifier = DiscordNotifier()
+        self.trades = TradeManager(self.notifier, self.stats)
+        self.scan_count = 0
+        self.last_heartbeat = time.time()
+
+    def scan_once(self) -> None:
+        self.scan_count += 1
+        BOT_STATE["scan_count"] = self.scan_count
+        BOT_STATE["last_scan"] = fmt_th(now_th())
+        BOT_STATE["active_trades"] = len(self.trades.trades)
+
+        live = self.feed.get_live_price()
+        if live > 0:
+            BOT_STATE["last_price"] = live
+            self.trades.monitor(live)
+
+        kz = KillzoneFilter.check()
+        BOT_STATE["killzone"] = kz["zone"]
+        if not kz["active"]:
+            BOT_STATE["status"] = "WAIT_OUTSIDE_KILLZONE"
+            log.info(f"[Scan #{self.scan_count}] ⏸️ {kz['reason']}")
             return
 
-        events = res.json()
-        today_usd_events = []
-
-        for ev in events:
-            if ev.get("country") == "USD" and ev.get("impact") in ["High", "Medium"]:
-                raw_date = ev.get("date")
-                if raw_date:
-                    dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-                    dt_th = dt.astimezone(tz_th)
-                    if dt_th.strftime("%Y-%m-%d") == today_str:
-                        impact_tag = "🔴 [HIGH IMPACT]" if ev.get("impact") == "High" else "🟠 [MEDIUM]"
-                        today_usd_events.append(
-                            f"`{dt_th.strftime('%H:%M น.')}` **{impact_tag}** {ev.get('title')}\n"
-                            f"└ 📊 *Forecast:* `{ev.get('forecast') or '-'}` │ *Previous:* `{ev.get('previous') or '-'}`"
-                        )
-
-        if today_usd_events:
-            embed = {
-                "author": {
-                    "name": "ECONOMIC CALENDAR // USD IMPACT RADAR",
-                    "icon_url": "https://cdn-icons-png.flaticon.com/512/3314/3314486.png"
-                },
-                "title": f"📅 กำหนดการข่าวเศรษฐกิจสำคัญ ({now_th.strftime('%d/%m/%Y')})",
-                "description": ">>> ⚠️ **คำเตือนความเสี่ยง:** ตลาดอาจมีความผันผวนสูงและ Spread ถ่างขึ้นในช่วงเวลาข่าวด้านล่าง กรุณาคุมความเสี่ยงอย่างเคร่งครัด\n\n" + "\n\n".join(today_usd_events),
-                "color": 0xFF4500,
-                "footer": {
-                    "text": "Forex Factory Data • Bangkok Time (GMT+7)",
-                    "icon_url": "https://cdn-icons-png.flaticon.com/512/2972/2972531.png"
-                },
-                "timestamp": datetime.now(pytz.utc).isoformat()
-            }
-            send_discord_message(embed)
-            logging.info("ส่งสรุปตารางข่าวเศรษฐกิจเวลาไทยเข้า Discord สำเร็จ")
-
-        last_news_check_date = today_str
-
-    except Exception as e:
-        logging.error(f"ดึงข่าว Forex Factory ไม่สำเร็จ: {e}")
-
-def calculate_technical_indicators(df):
-    """คำนวณ EMA 20, 50, 200, RSI 14 และ ATR 14"""
-    df["EMA_20"] = df["Close"].ewm(span=20, adjust=False).mean()
-    df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
-    df["EMA_200"] = df["Close"].ewm(span=200, adjust=False).mean()
-
-    delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df["RSI"] = 100 - (100 / (1 + rs))
-
-    df["H-L"] = df["High"] - df["Low"]
-    df["H-PC"] = (df["High"] - df["Close"].shift(1)).abs()
-    df["L-PC"] = (df["Low"] - df["Close"].shift(1)).abs()
-    df["TR"] = df[["H-L", "H-PC", "L-PC"]].max(axis=1)
-    df["ATR"] = df["TR"].rolling(14).mean()
-    return df
-
-def analyze_market_conditions(df):
-    """ระบบตรวจจับ Confluence (EMA + RSI + SMC FVG)"""
-    if len(df) < 205:
-        return None
-
-    df = calculate_technical_indicators(df)
-
-    curr = df.iloc[-1]
-    b3 = df.iloc[-2]
-    b2 = df.iloc[-3]
-    b1 = df.iloc[-4]
-
-    current_price = float(curr["Close"])
-    ema20 = float(curr["EMA_20"])
-    ema50 = float(curr["EMA_50"])
-    ema200 = float(curr["EMA_200"])
-    rsi = float(curr["RSI"]) if not pd.isna(curr["RSI"]) else 50.0
-    atr = float(curr["ATR"]) if not pd.isna(curr["ATR"]) else 3.5
-
-    bullish_factors = []
-    bearish_factors = []
-
-    if current_price > ema200:
-        bullish_factors.append("ราคาอยู่เหนือ EMA 200 (Bullish Major Trend)")
-    else:
-        bearish_factors.append("ราคาอยู่ใต้ EMA 200 (Bearish Major Trend)")
-
-    if ema20 > ema50:
-        bullish_factors.append("EMA 20 ตัดขึ้นเหนือ EMA 50 (Golden Cross)")
-    elif ema20 < ema50:
-        bearish_factors.append("EMA 20 ตัดลงใต้ EMA 50 (Death Cross)")
-
-    if 45 <= rsi <= 68:
-        bullish_factors.append(f"RSI โมเมนตัมขาขึ้นชัดเจน ({rsi:.1f})")
-    elif 32 <= rsi <= 55:
-        bearish_factors.append(f"RSI โมเมนตัมขาลงชัดเจน ({rsi:.1f})")
-
-    fvg_type = "None"
-    fvg_top = 0.0
-    fvg_bottom = 0.0
-
-    if b1["High"] < b3["Low"]:
-        fvg_top = float(b3["Low"])
-        fvg_bottom = float(b1["High"])
-        if curr["Low"] <= fvg_top and current_price >= fvg_bottom:
-            bullish_factors.append(f"SMC: รีเทสต์โซน Demand FVG ({fvg_bottom:.2f} - {fvg_top:.2f})")
-            fvg_type = "Bullish FVG Retest"
-
-    elif b1["Low"] > b3["High"]:
-        fvg_top = float(b1["Low"])
-        fvg_bottom = float(b3["High"])
-        if curr["High"] >= fvg_bottom and current_price <= fvg_top:
-            bearish_factors.append(f"SMC: เด้งทดสอบโซน Supply FVG ({fvg_bottom:.2f} - {fvg_top:.2f})")
-            fvg_type = "Bearish FVG Retest"
-
-    if len(bullish_factors) >= 3 and current_price > ema200:
-        signal = "BUY"
-        factors = bullish_factors
-    elif len(bearish_factors) >= 3 and current_price < ema200:
-        signal = "SELL"
-        factors = bearish_factors
-    else:
-        return None
-
-    return {
-        "signal": signal,
-        "fvg_type": fvg_type,
-        "fvg_top": round(fvg_top, 2),
-        "fvg_bottom": round(fvg_bottom, 2),
-        "current_price": round(current_price, 2),
-        "ema20": round(ema20, 2),
-        "ema50": round(ema50, 2),
-        "ema200": round(ema200, 2),
-        "rsi": round(rsi, 2),
-        "atr": round(atr, 2),
-        "factors": factors,
-        "recent_high": round(float(df["High"].iloc[-12:].max()), 2),
-        "recent_low": round(float(df["Low"].iloc[-12:].min()), 2)
-    }
-
-def gemini_advanced_validation(setup):
-    """ส่งข้อมูลคอนฟลูเอนซ์ให้ Gemini วิเคราะห์และกำหนด SL/TP (พร้อมระบบสำรองอัตโนมัติ)"""
-    entry = setup["current_price"]
-    sl_buffer = setup["atr"] * 1.5
-    fallback_sl = (entry - sl_buffer) if setup["signal"] == "BUY" else (entry + sl_buffer)
-    fallback_tp = (entry + (sl_buffer * CONFIG["MIN_RR_RATIO"])) if setup["signal"] == "BUY" else (entry - (sl_buffer * CONFIG["MIN_RR_RATIO"]))
-
-    fallback_decision = {
-        "action": setup["signal"],
-        "entry": entry,
-        "sl": round(fallback_sl, 2),
-        "tp": round(fallback_tp, 2),
-        "confidence": "Quant Rule-based",
-        "reason": "โครงสร้างราคาและ Indicator สอดคล้องตามกลยุทธ์ SMC + Confluence"
-    }
-
-    if not ai_client:
-        return fallback_decision
-
-    prompt = f"""
-    คุณเป็นนักวิเคราะห์ระบบเทรดทองคำ Spot Gold (XAUUSD) ที่เชี่ยวชาญ SMC, Price Action และ Multi-Indicator Confluence
-    ตรวจพบสัญญาณ:
-    - สัญญาณหลัก: {setup['signal']}
-    - ราคา Spot ล่าสุด: {setup['current_price']} | โซน FVG: {setup['fvg_type']} ({setup['fvg_bottom']} - {setup['fvg_top']})
-    - EMA 20/50/200: {setup['ema20']} / {setup['ema50']} / {setup['ema200']}
-    - RSI: {setup['rsi']} | ATR: {setup['atr']}
-    - สวิงราคาสุด: High {setup['recent_high']} / Low {setup['recent_low']}
-    - ปัจจัยยืนยัน: {", ".join(setup['factors'])}
-
-    เงื่อนไข:
-    1. ตรวจสอบว่าสัญญาณสอดคล้องกับภาพรวมเทรนด์ ไม่ติด Fakeout
-    2. ตั้ง SL นอกแนวสำคัญ และ TP อัตราส่วน R:R ไม่ต่ำกว่า 1:2
-    3. หากก้ำกึ่งให้ตอบ WAIT
-
-    ตอบเป็น JSON เท่านั้น:
-    {{
-        "action": "{setup['signal']}" หรือ "WAIT",
-        "entry": {setup['current_price']},
-        "sl": 0.0,
-        "tp": 0.0,
-        "confidence": "90%",
-        "reason": "สรุปเหตุผลกระชับ คมชัด สไตล์นักเทรดมืออาชีพ"
-    }}
-    """
-
-    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
-    
-    for m in models_to_try:
-        try:
-            response = ai_client.models.generate_content(
-                model=m,
-                contents=prompt
-            )
-            clean_text = response.text.strip()
-            if clean_text.startswith("```json"):
-                clean_text = clean_text[7:]
-            if clean_text.endswith("```"):
-                clean_text = clean_text[:-3]
-            return json.loads(clean_text.strip())
-        except Exception as e:
-            logging.warning(f"เรียกใช้โมเดล {m} ไม่สำเร็จ: {e}")
-            continue
-
-    logging.info("สลับมาใช้ระบบคำนวณ Quant SL/TP อัตโนมัติ")
-    return fallback_decision
-
-def check_active_trade(current_price):
-    global active_order, performance_stats
-    if not active_order:
-        return
-
-    side = active_order["action"]
-    entry = active_order["entry"]
-    tp = active_order["tp"]
-    sl = active_order["sl"]
-    outcome = None
-    pnl = 0.0
-
-    if side == "BUY":
-        if current_price >= tp:
-            outcome = "WIN"
-            pnl = round(current_price - entry, 2)
-        elif current_price <= sl:
-            outcome = "LOSS"
-            pnl = round(current_price - entry, 2)
-    elif side == "SELL":
-        if current_price <= tp:
-            outcome = "WIN"
-            pnl = round(entry - current_price, 2)
-        elif current_price >= sl:
-            outcome = "LOSS"
-            pnl = round(entry - current_price, 2)
-
-    if outcome:
-        performance_stats["total"] += 1
-        if outcome == "WIN":
-            performance_stats["wins"] += 1
-        else:
-            performance_stats["losses"] += 1
-
-        save_performance_stats(performance_stats)
-
-        win_rate = (performance_stats["wins"] / performance_stats["total"]) * 100
-        
-        is_win = (outcome == "WIN")
-        embed_color = 0x00FFA3 if is_win else 0xFF2A6D
-        status_banner = "🎯 [TRADE TARGET HIT // PROFIT LOCKED]" if is_win else "🛑 [STOP LOSS TRIGGERED // RISK MITIGATED]"
-        pnl_sign = "+" if pnl > 0 else ""
-        
-        embed = {
-            "title": status_banner,
-            "description": f"```diff\n{'+' if is_win else '-'} RESULT: {outcome} ({side} ORDER)\n{'+' if is_win else '-'} PnL: {pnl_sign}{pnl:.2f} PTS ({pnl_sign}{int(pnl*10)} PIPS)\n```",
-            "color": embed_color,
-            "fields": [
-                {
-                    "name": "📌 รายละเอียดราคา (Spot Gold)",
-                    "value": f"• จุดเข้า: `{entry:.2f}`\n• จุดปิด: `{current_price:.2f}`",
-                    "inline": True
-                },
-                {
-                    "name": "🏆 ผลงานสะสม",
-                    "value": f"• ชนะ: `{performance_stats['wins']}` ไม้\n• แพ้: `{performance_stats['losses']}` ไม้",
-                    "inline": True
-                },
-                {
-                    "name": "📈 WIN RATE สะสม",
-                    "value": f"```ansi\n\u001b[1;32m{win_rate:.1f}%\u001b[0m (จากทั้งหมด {performance_stats['total']} ไม้)\n```",
-                    "inline": False
-                }
-            ],
-            "footer": {
-                "text": "QUANT ALPHA ENGINE • SPOT GOLD REAL-TIME",
-                "icon_url": "https://cdn-icons-png.flaticon.com/512/1006/1006771.png"
-            },
-            "timestamp": datetime.now(pytz.utc).isoformat()
-        }
-        send_discord_message(embed)
-        active_order = None
-
-def run_bot_cycle():
-    global active_order
-    try:
-        check_and_send_thai_forex_news()
-
-        df = yf.download(CONFIG["SYMBOL"], period=CONFIG["HISTORY_PERIOD"], interval=CONFIG["INTERVAL"], progress=False)
-        if df.empty:
-            logging.info("รอข้อมูลแท่งเทียน Spot Gold...")
+        bo = self.news.check_blackout()
+        if bo["blackout"]:
+            BOT_STATE["status"] = "NEWS_BLACKOUT"
+            log.info(f"[Scan #{self.scan_count}] 📰 {bo['reason']}")
             return
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] for col in df.columns]
-
-        current_price = float(df["Close"].iloc[-1])
-        logging.info(f"เช็กราคาทองคำ Spot ล่าสุด: {current_price:.2f}")
-
-        # ส่งสัญญาณ Heartbeat ทุก 3 ชม. แจ้งเตือนว่าบอทยังเฝ้ากราฟอยู่
-        send_heartbeat_status(current_price)
-
-        if active_order:
-            check_active_trade(current_price)
+        ok, why = self.trades.can_open()
+        if not ok:
+            BOT_STATE["status"] = "COOLDOWN"
+            log.info(f"[Scan #{self.scan_count}] 🔒 {why}")
             return
 
-        setup = analyze_market_conditions(df)
-        if not setup:
-            logging.info("ยังไม่พบสัญญาณที่เข้าเงื่อนไข Confluence")
+        BOT_STATE["status"] = "SCANNING"
+        htf = self.feed.get_htf()
+        ltf = self.feed.get_ltf()
+        if htf.empty or ltf.empty:
+            log.warning(f"[Scan #{self.scan_count}] ข้อมูลราคาไม่ครบ ข้ามรอบนี้")
             return
 
-        decision = gemini_advanced_validation(setup)
-        if not decision or decision.get("action") == "WAIT":
-            logging.info("Gemini แนะนำให้รอจังหวะที่ชัดเจนกว่านี้ (WAIT)")
+        ctx = SMCEngine.evaluate(htf, ltf)
+        BOT_STATE["last_price"] = ctx["price"]
+
+        log.info(
+            f"[Scan #{self.scan_count}] 💰 {ctx['price']:.2f} | KZ={kz['zone']} | "
+            f"H1={ctx['htf_bias']} | Zone={ctx['pd_array']['zone']} "
+            f"({ctx['pd_array']['position_pct']:.0f}%) | RSI={ctx['ltf_rsi']:.1f} | "
+            f"Sweep(B/S)={ctx['sweep']['bullish_sweep']}/{ctx['sweep']['bearish_sweep']} | "
+            f"FVG={ctx['fvg']['type']}"
+        )
+
+        if ctx["direction"] == "NONE":
+            log.info(f"   ↳ ยังไม่ครบเกณฑ์ (ฝั่ง {ctx.get('best_side','-')} "
+                     f"ผ่าน {ctx.get('best_score','-')}) ขาด: {', '.join(ctx['reject_reasons'])}")
+            BOT_STATE["status"] = "NO_SETUP"
             return
 
-        active_order = decision
-        win_rate = (performance_stats["wins"] / performance_stats["total"] * 100) if performance_stats["total"] > 0 else 0.0
+        log.info(f"   ↳ ✅ พบ Confluence ฝั่ง {ctx['direction']} → ส่ง AI ตรวจสอบ")
+        news_next = self.news.next_event()
+        decision = self.ai.validate(ctx, kz, news_next)
 
-        is_buy = decision["action"] == "BUY"
-        embed_color = 0x00F0FF if is_buy else 0xFF0055
-        side_icon = "🟢 BUY LONG" if is_buy else "🔴 SELL SHORT"
-        
-        sl_points = abs(decision["entry"] - decision["sl"])
-        tp_points = abs(decision["tp"] - decision["entry"])
-        rr_ratio = (tp_points / sl_points) if sl_points > 0 else 2.0
+        if decision.get("decision") not in ("BUY", "SELL"):
+            log.info(f"   ↳ 🧠 AI สั่ง WAIT: {decision.get('reasoning_th', '-')}")
+            BOT_STATE["status"] = "AI_WAIT"
+            return
 
-        factors_formatted = "\n".join([f"├ ⚡ {f}" for f in setup["factors"][:-1]])
-        if setup["factors"]:
-            factors_formatted += f"\n└ ⚡ {setup['factors'][-1]}"
+        self.trades.open_trade(decision, ctx, kz, news_next)
+        BOT_STATE["status"] = "SIGNAL_SENT"
+        BOT_STATE["active_trades"] = len(self.trades.trades)
 
-        embed = {
-            "title": f"⚡ NEW SIGNAL: {side_icon} (XAUUSD / M15)",
-            "description": (
-                f">>> **กลยุทธ์:** `SMC + Multi-Confluence Matrix`\n"
-                f"**เหตุผลการเข้า:** {decision.get('reason', 'ตรวจพบการบรรจบกันของโครงสร้างราคาและตัวชี้วัด')}\n"
-                f"**ระดับความมั่นใจ:** `{decision.get('confidence', 'HIGH')}`"
-            ),
-            "color": embed_color,
-            "fields": [
-                {
-                    "name": "🎯 แผนราคา Spot Gold (Trade Parameters)",
-                    "value": (
-                        f"```yaml\n"
-                        f"ENTRY : {decision['entry']:.2f}\n"
-                        f"SL    : {decision['sl']:.2f} (-{sl_points:.1f} pts)\n"
-                        f"TP    : {decision['tp']:.2f} (+{tp_points:.1f} pts)\n"
-                        f"R:R   : 1:{rr_ratio:.1f}\n"
-                        f"```"
-                    ),
-                    "inline": False
-                },
-                {
-                    "name": "🔬 ปัจจัยยืนยันร่วม (Confluence Factors)",
-                    "value": factors_formatted,
-                    "inline": False
-                },
-                {
-                    "name": "📊 สถิติระบบบอท",
-                    "value": f"`WIN RATE: {win_rate:.1f}%` │ ชนะ `{performance_stats['wins']}` / แพ้ `{performance_stats['losses']}`",
-                    "inline": True
-                },
-                {
-                    "name": "🛡️ แนะนำความเสี่ยง",
-                    "value": "`1 - 2% ของพอร์ต`",
-                    "inline": True
-                }
-            ],
-            "footer": {
-                "text": "Gemini AI Flash • Spot Gold Real-Time • Timeframe 15M",
-                "icon_url": "https://cdn-icons-png.flaticon.com/512/2586/2586057.png"
-            },
-            "timestamp": datetime.now(pytz.utc).isoformat()
-        }
-        send_discord_message(embed)
-        logging.info(f"ส่งซิกแนล Spot {decision['action']} เข้า Discord เรียบร้อย!")
+    def maybe_heartbeat(self) -> None:
+        if (time.time() - self.last_heartbeat) >= CFG.HEARTBEAT_HOURS * 3600:
+            try:
+                self.notifier.send_heartbeat(
+                    self.stats, BOT_STATE["last_price"],
+                    KillzoneFilter.check(), self.trades.trades
+                )
+                self.last_heartbeat = time.time()
+            except Exception as e:
+                log.warning(f"[Heartbeat] ส่งไม่สำเร็จ: {e}")
 
-    except Exception as e:
-        logging.error(f"รอบการทำงานผิดพลาด: {e}")
+    def run(self) -> None:
+        log.info("=" * 70)
+        log.info("  INSTITUTIONAL SPOT GOLD (XAUUSD) SMC BOT STARTING...")
+        log.info("=" * 70)
+        BOT_STATE["status"] = "running"
+        self.news.fetch(force=True)
+        self.notifier.send_startup(self.stats)
+
+        while True:
+            cycle_start = time.time()
+            try:
+                self.scan_once()
+                self.maybe_heartbeat()
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                log.error(f"[Main] เกิดข้อผิดพลาด: {e}")
+                log.error(traceback.format_exc())
+                time.sleep(30)
+
+            elapsed = time.time() - cycle_start
+            time.sleep(max(CFG.SCAN_INTERVAL_SEC - elapsed, 10))
+
 
 def main():
-    logging.info("🚀 Spot Gold Quant Bot (SMC + FVG + Thai Forex News) เริ่มทำงานแล้ว...")
-    send_startup_alert()
-    while True:
-        run_bot_cycle()
-        time.sleep(CONFIG["CHECK_INTERVAL_SEC"])
+    start_web_server()
+    time.sleep(1)
+    bot = GoldSMCBot()
+    bot.run()
+
 
 if __name__ == "__main__":
     main()
