@@ -13,10 +13,11 @@ from google import genai
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 CONFIG = {
-    # เปลี่ยนเป็น PAXG-USD (Spot Gold 1:1 London Benchmark) เพื่อให้ราคาตรงกับ XAUUSD ใน MT5
+    # PAXG-USD (Spot Gold 1:1 London Benchmark) ราคาตรงกับ XAUUSD ใน MT5
     "SYMBOL": "PAXG-USD",       
     "INTERVAL": "15m",          # กรอบเวลา 15 นาที
     "CHECK_INTERVAL_SEC": 300,  # ตรวจสอบกราฟทุก 5 นาที
+    "HEARTBEAT_INTERVAL_SEC": 10800, # ส่งการ์ดรายงานตัวทุก 3 ชั่วโมง (10,800 วินาที)
     "HISTORY_PERIOD": "5d",
     "MIN_RR_RATIO": 2.0,
     "STATS_FILE": "stats.json"
@@ -29,6 +30,7 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 active_order = None
 last_news_check_date = None
+last_heartbeat_time = 0
 
 def load_performance_stats():
     """โหลดสถิติจากไฟล์ JSON หากไม่มีให้สร้างใหม่"""
@@ -66,6 +68,52 @@ def send_discord_message(embed_data):
         res.raise_for_status()
     except Exception as e:
         logging.error(f"ส่ง Discord ไม่สำเร็จ: {e}")
+
+def send_startup_alert():
+    """แจ้งเตือนเข้า Discord ทันทีที่เซิร์ฟเวอร์สตาร์ท เพื่อยืนยันว่าระบบออนไลน์แล้ว"""
+    embed = {
+        "title": "🟢 BOT ONLINE // SYSTEM INITIALIZED",
+        "description": (
+            ">>> **ระบบเทรดอัจฉริยะ SMC + Confluence เริ่มทำงานแล้ว!**\n"
+            "• **สินทรัพย์:** Spot Gold (XAUUSD)\n"
+            "• **ไทม์เฟรม:** M15 (สแกนแท่งเทียนทุก 5 นาที)\n"
+            "• **สถานะ Uptime:** เชื่อมต่อเรียบร้อย เฝ้าตลาด 24 ชม."
+        ),
+        "color": 0x00FF88,
+        "footer": {
+            "text": "Spot Gold Engine Active • Live Monitoring",
+            "icon_url": "https://cdn-icons-png.flaticon.com/512/1006/1006771.png"
+        },
+        "timestamp": datetime.now(pytz.utc).isoformat()
+    }
+    send_discord_message(embed)
+    logging.info("ส่งข้อความ Startup เข้า Discord สำเร็จ")
+
+def send_heartbeat_status(current_price):
+    """ส่งรายงานสถานะบอทยังตื่นอยู่พร้อมราคาปัจจุบันทุกๆ 3 ชม."""
+    global last_heartbeat_time
+    now = time.time()
+    if now - last_heartbeat_time < CONFIG["HEARTBEAT_INTERVAL_SEC"]:
+        return
+
+    win_rate = (performance_stats["wins"] / performance_stats["total"] * 100) if performance_stats["total"] > 0 else 0.0
+    embed = {
+        "title": "💓 HEARTBEAT // BOT IS ACTIVE & WATCHING",
+        "description": (
+            f">>> 📡 **สถานะ:** กำลังเฝ้าโครงสร้างราคาตามปกติ\n"
+            f"💰 **Spot Gold ล่าสุด:** `{current_price:.2f}`\n"
+            f"📊 **Win Rate รวม:** `{win_rate:.1f}%` (ชนะ {performance_stats['wins']} / แพ้ {performance_stats['losses']})"
+        ),
+        "color": 0x5865F2,
+        "footer": {
+            "text": "Every 3 Hours Heartbeat • System Healthy",
+            "icon_url": "https://cdn-icons-png.flaticon.com/512/2972/2972531.png"
+        },
+        "timestamp": datetime.now(pytz.utc).isoformat()
+    }
+    send_discord_message(embed)
+    last_heartbeat_time = now
+    logging.info("ส่งข้อความ Heartbeat ประจำรอบเข้า Discord สำเร็จ")
 
 def check_and_send_thai_forex_news():
     """ดึงข่าว Forex Factory ประจำวัน แปลงเวลาเป็นเวลาไทย (GMT+7) และแจ้งเตือนอัตโนมัติ"""
@@ -376,6 +424,9 @@ def run_bot_cycle():
         current_price = float(df["Close"].iloc[-1])
         logging.info(f"เช็กราคาทองคำ Spot ล่าสุด: {current_price:.2f}")
 
+        # ส่งสัญญาณ Heartbeat ทุก 3 ชม. แจ้งเตือนว่าบอทยังเฝ้ากราฟอยู่
+        send_heartbeat_status(current_price)
+
         if active_order:
             check_active_trade(current_price)
             return
@@ -456,6 +507,7 @@ def run_bot_cycle():
 
 def main():
     logging.info("🚀 Spot Gold Quant Bot (SMC + FVG + Thai Forex News) เริ่มทำงานแล้ว...")
+    send_startup_alert()
     while True:
         run_bot_cycle()
         time.sleep(CONFIG["CHECK_INTERVAL_SEC"])
