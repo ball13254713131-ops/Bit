@@ -18,6 +18,7 @@ import sys
 import json
 import time
 import math
+import socket
 import threading
 import logging
 import traceback
@@ -90,13 +91,12 @@ class CFG:
     # ---------- AI Brain ----------
     AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-    # รองรับ fallback ระหว่าง gemini-2.5-flash และ gemini-1.5-flash
     GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
     CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
     AI_TIMEOUT = int(os.getenv("AI_TIMEOUT", "30"))
 
-    # ---------- Discord (รองรับทั้งสองชื่อ Env) ----------
+    # ---------- Discord ----------
     DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK", "")
     HEARTBEAT_HOURS = int(os.getenv("HEARTBEAT_HOURS", "3"))
 
@@ -104,8 +104,8 @@ class CFG:
     STATS_FILE = os.getenv("STATS_FILE", "stats.json")
     TRADES_FILE = os.getenv("TRADES_FILE", "active_trades.json")
 
-    # ---------- Web Server ----------
-    PORT = int(os.getenv("PORT", "8080"))
+    # ---------- Web Server (ดึง $PORT ของ Render ก่อนเสมอ) ----------
+    PORT = int(os.getenv("PORT", "10000"))
 
     # ---------- Gold Conversion ----------
     POINT_VALUE = 0.01
@@ -655,7 +655,6 @@ Validate the technical setup strictly and return ONLY a valid JSON object (no ma
         }
 
     def _call_gemini(self, payload: dict) -> str:
-        # ลองโมเดล gemini-2.5-flash ก่อน หากไม่สำเร็จให้ fallback ไปที่ gemini-1.5-flash
         models = [CFG.GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash"]
         last_e = None
         for m in models:
@@ -1152,7 +1151,7 @@ class TradeManager:
 
 
 # ==========================================================================================
-# SECTION 6.4 : KEEP-ALIVE WEB SERVER
+# SECTION 6.4 : KEEP-ALIVE WEB SERVER (แก้ปัญหา Address already in use)
 # ==========================================================================================
 BOT_STATE = {
     "status": "starting",
@@ -1163,6 +1162,11 @@ BOT_STATE = {
     "killzone": "-",
     "active_trades": 0,
 }
+
+
+class ReusableHTTPServer(HTTPServer):
+    """เปิดใช้ SO_REUSEADDR ป้องกัน [Errno 98] Address already in use เมื่อรีสตาร์ท"""
+    allow_reuse_address = True
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -1209,12 +1213,12 @@ def start_web_server() -> None:
     def _run():
         while True:
             try:
-                srv = HTTPServer(("0.0.0.0", CFG.PORT), HealthHandler)
+                srv = ReusableHTTPServer(("0.0.0.0", CFG.PORT), HealthHandler)
                 log.info(f"[Web] Keep-Alive Server พร้อมทำงานที่พอร์ต {CFG.PORT}")
                 srv.serve_forever()
             except Exception as e:
-                log.error(f"[Web] Server ขัดข้อง: {e}")
-                time.sleep(10)
+                log.warning(f"[Web] Server รอรีสตาร์ท: {e}")
+                time.sleep(5)
 
     threading.Thread(target=_run, daemon=True, name="WebServer").start()
 
