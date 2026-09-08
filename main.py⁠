@@ -1,261 +1,369 @@
 import os
-import sys
 import time
 import json
 import logging
 from datetime import datetime
-from typing import Dict, Any, Optional
-
+import pytz
 import requests
-import yfinance as yf
 import pandas as pd
+import yfinance as yf
 from google import genai
-from google.genai import types
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("quant_bot.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("QuantTracker")
+# ตั้งค่า Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 CONFIG = {
-    "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
-    "DISCORD_WEBHOOK_URL": os.getenv("DISCORD_WEBHOOK_URL", ""),
-    "SYMBOL": "GC=F",
-    "DISPLAY_NAME": "XAUUSD (Gold)",
-    "INTERVAL": "15m",
-    "CHECK_SECONDS": 300,
-    "DB_FILE": "quant_trade_history.json"
+    "SYMBOL": "GC=F",           # ทองคำ Gold Futures
+    "INTERVAL": "15m",          # กรอบเวลา 15 นาที
+    "CHECK_INTERVAL_SEC": 300,  # ตรวจสอบกราฟทุก 5 นาที
+    "HISTORY_PERIOD": "5d",
+    "MIN_RR_RATIO": 2.0
 }
 
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+active_order = None
+performance_stats = {"wins": 0, "losses": 0, "total": 0}
+last_news_check_date = None
+
+def send_discord_message(embed_data):
+    """ส่งข้อความ Embed แจ้งเตือนเข้า Discord Webhook"""
+    if not DISCORD_WEBHOOK_URL:
+        logging.warning("ไม่พบ DISCORD_WEBHOOK_URL")
+        return
+    try:
+        payload = {"embeds": [embed_data]}
+        res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        res.raise_for_status()
+    except Exception as e:
+        logging.error(f"ส่ง Discord ไม่สำเร็จ: {e}")
+
+def check_and_send_thai_forex_news():
+    """ดึงข่าว Forex Factory ประจำวัน แปลงเวลาเป็นเวลาไทย (GMT+7) และแจ้งเตือนอัตโนมัติ"""
+    global last_news_check_date
+    tz_th = pytz.timezone("Asia/Bangkok")
+    now_th = datetime.now(tz_th)
+    today_str = now_th.strftime("%Y-%m-%d")
+
+    # ตรวจสอบวันละ 1 ครั้ง
+    if last_news_check_date == today_str:
+        return
+
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            return
+
+        events = res.json()
+        today_usd_events = []
+
+        for ev in events:
+            if ev.get("country") == "USD" and ev.get("impact") in ["High", "Medium"]:
+                raw_date = ev.get("date")
+                if raw_date:
+                    dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                    dt_th = dt.astimezone(tz_th)
+                    if dt_th.strftime("%Y-%m-%d") == today_str:
+                        impact_icon = "🔴 กล่องแดง" if ev.get("impact") == "High" else "🟠 กล่องส้ม"
+                        today_usd_events.append(
+                            f"⏰ **{dt_th.strftime('%H:%M น.')}** | {impact_icon}\n"
+                            f"📌 **{ev.get('title')}** (คาดการณ์: `{ev.get('forecast') or '-'}` / เดิม: `{ev.get('previous') or '-'}`)"
+                        )
+
+        if today_usd_events:
+            embed = {
+                "title": f"📅 ตารางข่าวเศรษฐกิจสำคัญประจำวันนี้ ({now_th.strftime('%d/%m/%Y')})",
+                "description": "เวลาทั้งหมดถูกแปลงเป็น **เวลาไทย (GMT+7)** เรียบร้อยแล้วครับ\n\n" + "\n\n".join(today_usd_events),
+                "color": 16724787,
+                "footer": {"text": "Forex Factory Calendar • เวลาประเทศไทย (GMT+7)"}
+            }
+            send_discord_message(embed)
+            logging.info("ส่งสรุปตารางข่าวเศรษฐกิจเวลาไทยเข้า Discord สำเร็จ")
+
+        last_news_check_date = today_str
+
+    except Exception as e:
+        logging.error(f"ดึงข่าว Forex Factory ไม่สำเร็จ: {e}")
+
+def calculate_technical_indicators(df):
+    """คำนวณ EMA 20, 50, 200, RSI 14 และ ATR 14"""
+    df["EMA_20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    df["EMA_200"] = df["Close"].ewm(span=200, adjust=False).mean()
+
+    delta = df["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    df["RSI"] = 100 - (100 / (1 + rs))
 
-    high_low = df['High'] - df['Low']
-    high_close = (df['High'] - df['Close'].shift()).abs()
-    low_close = (df['Low'] - df['Close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['ATR'] = tr.rolling(window=14).mean()
+    df["H-L"] = df["High"] - df["Low"]
+    df["H-PC"] = (df["High"] - df["Close"].shift(1)).abs()
+    df["L-PC"] = (df["Low"] - df["Close"].shift(1)).abs()
+    df["TR"] = df[["H-L", "H-PC", "L-PC"]].max(axis=1)
+    df["ATR"] = df["TR"].rolling(14).mean()
     return df
 
-def evaluate_quant_setup(df: pd.DataFrame) -> Optional[str]:
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    price = last['Close']
-    ema200 = last['EMA_200']
-    ema20 = last['EMA_20']
-    ema50 = last['EMA_50']
-    rsi = last['RSI']
+def analyze_market_conditions(df):
+    """ระบบตรวจจับ Confluence (EMA + RSI + SMC FVG)"""
+    if len(df) < 205:
+        return None
 
-    if price > ema200 and ema20 > ema50 and 45 < rsi < 68:
-        if prev['EMA_20'] <= prev['EMA_50'] or price > last['EMA_20']:
-            return "BUY"
+    df = calculate_technical_indicators(df)
 
-    if price < ema200 and ema20 < ema50 and 32 < rsi < 55:
-        if prev['EMA_20'] >= prev['EMA_50'] or price < last['EMA_20']:
-            return "SELL"
+    curr = df.iloc[-1]
+    b3 = df.iloc[-2]
+    b2 = df.iloc[-3]
+    b1 = df.iloc[-4]
 
-    return None
+    current_price = float(curr["Close"])
+    ema20 = float(curr["EMA_20"])
+    ema50 = float(curr["EMA_50"])
+    ema200 = float(curr["EMA_200"])
+    rsi = float(curr["RSI"]) if not pd.isna(curr["RSI"]) else 50.0
+    atr = float(curr["ATR"]) if not pd.isna(curr["ATR"]) else 3.5
 
-def load_db() -> Dict[str, Any]:
-    if not os.path.exists(CONFIG["DB_FILE"]):
-        data = {
-            "stats": {"total": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "pnl_points": 0.0},
-            "active_signal": None,
-            "closed": []
-        }
-        with open(CONFIG["DB_FILE"], "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
-        return data
-    with open(CONFIG["DB_FILE"], "r", encoding="utf-8") as f:
-        return json.load(f)
+    bullish_factors = []
+    bearish_factors = []
 
-def save_db(data: Dict[str, Any]):
-    with open(CONFIG["DB_FILE"], "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-def send_discord(title: str, desc: str, color: int, fields: list):
-    url = CONFIG["DISCORD_WEBHOOK_URL"]
-    if not url:
-        return
-    payload = {
-        "embeds": [{
-            "title": title,
-            "description": desc,
-            "color": color,
-            "fields": fields,
-            "footer": {"text": "Gemini Quant AI System"}
-        }]
-    }
-    try:
-        requests.post(url, json=payload, timeout=8)
-    except Exception as e:
-        logger.error(f"Discord error: {e}")
-
-def get_gemini_confirmation(action: str, current_price: float, atr: float) -> Dict[str, Any]:
-    client = genai.Client(api_key=CONFIG["GEMINI_API_KEY"])
-    sl_dist = round(atr * 1.5, 2)
-    tp_dist = round(atr * 2.5, 2)
-
-    if action == "BUY":
-        calc_sl = round(current_price - sl_dist, 2)
-        calc_tp = round(current_price + tp_dist, 2)
+    if current_price > ema200:
+        bullish_factors.append("เหนือเส้น EMA 200 (Bullish Major Trend)")
     else:
-        calc_sl = round(current_price + sl_dist, 2)
-        calc_tp = round(current_price - tp_dist, 2)
+        bearish_factors.append("ใต้เส้น EMA 200 (Bearish Major Trend)")
+
+    if ema20 > ema50:
+        bullish_factors.append("EMA 20 > EMA 50 (Golden Cross)")
+    elif ema20 < ema50:
+        bearish_factors.append("EMA 20 < EMA 50 (Death Cross)")
+
+    if 45 <= rsi <= 68:
+        bullish_factors.append(f"RSI แข็งแกร่ง ({rsi:.1f})")
+    elif 32 <= rsi <= 55:
+        bearish_factors.append(f"RSI อ่อนแรง ({rsi:.1f})")
+
+    fvg_type = "None"
+    fvg_top = 0.0
+    fvg_bottom = 0.0
+
+    if b1["High"] < b3["Low"]:
+        fvg_top = float(b3["Low"])
+        fvg_bottom = float(b1["High"])
+        if curr["Low"] <= fvg_top and current_price >= fvg_bottom:
+            bullish_factors.append(f"SMC: รีเทสต์ Bullish FVG ({fvg_bottom:.2f} - {fvg_top:.2f})")
+            fvg_type = "Bullish FVG Retest"
+
+    elif b1["Low"] > b3["High"]:
+        fvg_top = float(b1["Low"])
+        fvg_bottom = float(b3["High"])
+        if curr["High"] >= fvg_bottom and current_price <= fvg_top:
+            bearish_factors.append(f"SMC: เด้งทดสอบ Bearish FVG ({fvg_bottom:.2f} - {fvg_top:.2f})")
+            fvg_type = "Bearish FVG Retest"
+
+    if len(bullish_factors) >= 3 and current_price > ema200:
+        signal = "BUY"
+        factors = bullish_factors
+    elif len(bearish_factors) >= 3 and current_price < ema200:
+        signal = "SELL"
+        factors = bearish_factors
+    else:
+        return None
+
+    return {
+        "signal": signal,
+        "fvg_type": fvg_type,
+        "fvg_top": round(fvg_top, 2),
+        "fvg_bottom": round(fvg_bottom, 2),
+        "current_price": round(current_price, 2),
+        "ema20": round(ema20, 2),
+        "ema50": round(ema50, 2),
+        "ema200": round(ema200, 2),
+        "rsi": round(rsi, 2),
+        "atr": round(atr, 2),
+        "factors": factors,
+        "recent_high": round(float(df["High"].iloc[-12:].max()), 2),
+        "recent_low": round(float(df["Low"].iloc[-12:].min()), 2)
+    }
+
+def gemini_advanced_validation(setup):
+    """ส่งข้อมูลคอนฟลูเอนซ์ให้ Gemini วิเคราะห์และกำหนด SL/TP (พร้อมระบบสำรองอัตโนมัติ)"""
+    entry = setup["current_price"]
+    sl_buffer = setup["atr"] * 1.5
+    fallback_sl = (entry - sl_buffer) if setup["signal"] == "BUY" else (entry + sl_buffer)
+    fallback_tp = (entry + (sl_buffer * CONFIG["MIN_RR_RATIO"])) if setup["signal"] == "BUY" else (entry - (sl_buffer * CONFIG["MIN_RR_RATIO"]))
+
+    fallback_decision = {
+        "action": setup["signal"],
+        "entry": entry,
+        "sl": round(fallback_sl, 2),
+        "tp": round(fallback_tp, 2),
+        "confidence": "Quant Rule-based",
+        "reason": "SMC & Multi-Indicator Confluence (Auto Calculated)"
+    }
+
+    if not ai_client:
+        return fallback_decision
 
     prompt = f"""
-วิเคราะห์จุดเข้าเทรด Quant Setup:
-- สินทรัพย์: {CONFIG['DISPLAY_NAME']}
-- สัญญาณ: {action}
-- ราคาปัจจุบัน: {current_price:.2f}
-- แนะนำ SL: {calc_sl}
-- แนะนำ TP: {calc_tp}
+    คุณเป็นนักวิเคราะห์ระบบเทรดทองคำ (XAUUSD) ที่เชี่ยวชาญ SMC, Price Action และ Multi-Indicator Confluence
+    ตรวจพบสัญญาณ:
+    - สัญญาณหลัก: {setup['signal']}
+    - ราคา: {setup['current_price']} | โซน FVG: {setup['fvg_type']} ({setup['fvg_bottom']} - {setup['fvg_top']})
+    - EMA 20/50/200: {setup['ema20']} / {setup['ema50']} / {setup['ema200']}
+    - RSI: {setup['rsi']} | ATR: {setup['atr']}
+    - สวิงราคาสุด: High {setup['recent_high']} / Low {setup['recent_low']}
+    - ปัจจัยยืนยัน: {", ".join(setup['factors'])}
 
-ตรวจสอบความสมเหตุสมผลและตอบกลับเป็น JSON เท่านั้น:
-{{
-  "approved": true,
-  "action": "{action}",
-  "entry": {current_price:.2f},
-  "stop_loss": {calc_sl},
-  "take_profit": {calc_tp},
-  "risk_reward": "1:1.67",
-  "reason": "เหตุผลสั้นๆ 1-2 บรรทัด"
-}}
-"""
-    try:
-        res = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
-        )
-        return json.loads(res.text)
-    except Exception as e:
-        logger.error(f"Gemini API Error: {e}")
-        return {"approved": False}
+    เงื่อนไข:
+    1. ตรวจสอบว่าสัญญาณสอดคล้องกับภาพรวมเทรนด์ ไม่ติด Fakeout
+    2. ตั้ง SL นอกแนวสำคัญ และ TP อัตราส่วน R:R ไม่ต่ำกว่า 1:2
+    3. หากก้ำกึ่งให้ตอบ WAIT
 
-def check_win_loss(high: float, low: float):
-    db = load_db()
-    sig = db.get("active_signal")
-    if not sig:
+    ตอบเป็น JSON เท่านั้น:
+    {{
+        "action": "{setup['signal']}" หรือ "WAIT",
+        "entry": {setup['current_price']},
+        "sl": 0.0,
+        "tp": 0.0,
+        "confidence": "85%",
+        "reason": "สรุปเหตุผลสั้นๆ 1 ประโยค"
+    }}
+    """
+
+    # ใช้โมเดล gemini-3.6-flash ตามที่ API แจ้ง
+    models_to_try = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+    
+    for m in models_to_try:
+        try:
+            response = ai_client.models.generate_content(
+                model=m,
+                contents=prompt
+            )
+            clean_text = response.text.strip()
+            if clean_text.startswith("```json"):
+                clean_text = clean_text[7:]
+            if clean_text.endswith("```"):
+                clean_text = clean_text[:-3]
+            return json.loads(clean_text.strip())
+        except Exception as e:
+            logging.warning(f"เรียกใช้โมเดล {m} ไม่สำเร็จ: {e}")
+            continue
+
+    # หาก API ทั้งหมดไม่สามารถใช้งานได้ ให้ใช้ระบบ Quant คำนวณ SL/TP อัตโนมัติทันที
+    logging.info("สลับมาใช้ระบบคำนวณ Quant SL/TP อัตโนมัติ")
+    return fallback_decision
+
+def check_active_trade(current_price):
+    global active_order, performance_stats
+    if not active_order:
         return
 
-    action = sig["action"]
-    entry = sig["entry"]
-    tp = sig["take_profit"]
-    sl = sig["stop_loss"]
-
+    side = active_order["action"]
+    entry = active_order["entry"]
+    tp = active_order["tp"]
+    sl = active_order["sl"]
     outcome = None
-    exit_p = 0.0
+    pnl = 0.0
 
-    if action == "BUY":
-        if high >= tp:
+    if side == "BUY":
+        if current_price >= tp:
             outcome = "WIN"
-            exit_p = tp
-        elif low <= sl:
+            pnl = round(current_price - entry, 2)
+        elif current_price <= sl:
             outcome = "LOSS"
-            exit_p = sl
-    elif action == "SELL":
-        if low <= tp:
+            pnl = round(current_price - entry, 2)
+    elif side == "SELL":
+        if current_price <= tp:
             outcome = "WIN"
-            exit_p = tp
-        elif high >= sl:
+            pnl = round(entry - current_price, 2)
+        elif current_price >= sl:
             outcome = "LOSS"
-            exit_p = sl
+            pnl = round(entry - current_price, 2)
 
     if outcome:
-        pts = abs(exit_p - entry) if outcome == "WIN" else -abs(exit_p - entry)
-        stats = db["stats"]
-        stats["total"] += 1
+        performance_stats["total"] += 1
         if outcome == "WIN":
-            stats["wins"] += 1
+            performance_stats["wins"] += 1
         else:
-            stats["losses"] += 1
+            performance_stats["losses"] += 1
 
-        stats["win_rate"] = round((stats["wins"] / stats["total"]) * 100, 2)
-        stats["pnl_points"] = round(stats["pnl_points"] + pts, 2)
+        win_rate = (performance_stats["wins"] / performance_stats["total"]) * 100
+        embed = {
+            "title": f"{'🎯 ปิดกำไรเรียบร้อย (WIN) 🚀' if outcome == 'WIN' else '🛑 ตัดขาดทุน (SL Hit)'}",
+            "color": 3066993 if outcome == "WIN" else 15158332,
+            "fields": [
+                {"name": "ออเดอร์", "value": f"`{side}`", "inline": True},
+                {"name": "กำไร/ขาดทุน", "value": f"`{pnl:+} จุด`", "inline": True},
+                {"name": "ราคาปิด", "value": f"`{current_price}`", "inline": True},
+                {"name": "สถิติสะสม", "value": f"🏆 ชนะ: {performance_stats['wins']} | ❌ แพ้: {performance_stats['losses']}", "inline": False},
+                {"name": "📊 Win Rate รวม", "value": f"`{win_rate:.1f}%` (จากทั้งหมด {performance_stats['total']} ไม้)", "inline": False}
+            ],
+            "footer": {"text": "Hybrid Quant Engine • SMC + FVG + Indicators"}
+        }
+        send_discord_message(embed)
+        active_order = None
 
-        db["closed"].append({
-            "action": action, "entry": entry, "exit": exit_p,
-            "outcome": outcome, "points": pts, "closed_at": datetime.now().strftime("%Y-%m-%d %H:%M")
-        })
-        db["active_signal"] = None
-        save_db(db)
+def run_bot_cycle():
+    global active_order
+    try:
+        check_and_send_thai_forex_news()
 
-        color = 3066993 if outcome == "WIN" else 15158332
-        send_discord(
-            title=f"🎯 สรุปผลซิกแนล: {'ชนะ (WIN) 🎉' if outcome == 'WIN' else 'แพ้ (LOSS) ❌'}",
-            desc=f"ออเดอร์ **{action} {CONFIG['DISPLAY_NAME']}** ปิดเรียบร้อยแล้ว",
-            color=color,
-            fields=[
-                {"name": "ผลลัพธ์", "value": f"**{outcome}** ({pts:+.2f} pts)", "inline": True},
-                {"name": "เข้า / ออก", "value": f"{entry:.2f} ➔ {exit_p:.2f}", "inline": True},
-                {"name": "สถิติสะสม", "value": f"🏆 ชนะ: **{stats['wins']}** | ❌ แพ้: **{stats['losses']}**", "inline": False},
-                {"name": "📊 Win Rate รวม", "value": f"**{stats['win_rate']}%** (จาก {stats['total']} ไม้)", "inline": False}
-            ]
-        )
+        df = yf.download(CONFIG["SYMBOL"], period=CONFIG["HISTORY_PERIOD"], interval=CONFIG["INTERVAL"], progress=False)
+        if df.empty:
+            logging.info("รอข้อมูลแท่งเทียน...")
+            return
 
-def run():
-    logger.info("Hybrid Quant Bot Started...")
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] for col in df.columns]
+
+        current_price = float(df["Close"].iloc[-1])
+        logging.info(f"เช็กราคาทองคำล่าสุด: {current_price}")
+
+        if active_order:
+            check_active_trade(current_price)
+            return
+
+        setup = analyze_market_conditions(df)
+        if not setup:
+            logging.info("ยังไม่พบสัญญาณที่เข้าเงื่อนไข Confluence")
+            return
+
+        decision = gemini_advanced_validation(setup)
+        if not decision or decision.get("action") == "WAIT":
+            logging.info("Gemini แนะนำให้รอจังหวะที่ชัดเจนกว่านี้ (WAIT)")
+            return
+
+        active_order = decision
+        win_rate = (performance_stats["wins"] / performance_stats["total"] * 100) if performance_stats["total"] > 0 else 0.0
+
+        factors_text = "\n".join([f"• {f}" for f in setup["factors"]])
+        embed = {
+            "title": f"⚡ ซิกแนลใหม่: {decision['action']} XAUUSD (Multi-System Hybrid)",
+            "description": f"**เหตุผลวิเคราะห์:** {decision.get('reason', 'SMC + Technical Confluence')}\n**ความมั่นใจ:** `{decision.get('confidence', 'Normal')}`",
+            "color": 3447003 if decision['action'] == "BUY" else 15105570,
+            "fields": [
+                {"name": "จุดเข้า (Entry)", "value": f"`{decision['entry']}`", "inline": True},
+                {"name": "🛑 Stop Loss (SL)", "value": f"`{decision['sl']}`", "inline": True},
+                {"name": "🎯 Take Profit (TP)", "value": f"`{decision['tp']}`", "inline": True},
+                {"name": "สัญญาณยืนยันร่วม (Confluence)", "value": factors_text, "inline": False},
+                {"name": "สถิติสะสม", "value": f"ชนะ {performance_stats['wins']} / แพ้ {performance_stats['losses']} (Win Rate: {win_rate:.1f}%)", "inline": False}
+            ],
+            "footer": {"text": "SMC • FVG • EMA 200/50/20 • RSI • Gemini Flash"}
+        }
+        send_discord_message(embed)
+        logging.info(f"ส่งซิกแนล {decision['action']} เข้า Discord เรียบร้อย!")
+
+    except Exception as e:
+        logging.error(f"รอบการทำงานผิดพลาด: {e}")
+
+def main():
+    logging.info("🚀 Hybrid Quant Bot (SMC + FVG + Thai Forex News) เริ่มทำงานแล้ว...")
     while True:
-        try:
-            ticker = yf.Ticker(CONFIG["SYMBOL"])
-            df = ticker.history(interval=CONFIG["INTERVAL"], period="5d")
-
-            if not df.empty and len(df) > 200:
-                df = calculate_indicators(df)
-                last_high = float(df['High'].iloc[-1])
-                last_low = float(df['Low'].iloc[-1])
-                curr_price = float(df['Close'].iloc[-1])
-                atr = float(df['ATR'].iloc[-1])
-
-                check_win_loss(last_high, last_low)
-
-                db = load_db()
-                if db.get("active_signal") is None:
-                    signal_action = evaluate_quant_setup(df)
-                    if signal_action:
-                        confirm = get_gemini_confirmation(signal_action, curr_price, atr)
-                        if confirm.get("approved"):
-                            db["active_signal"] = {
-                                "action": signal_action,
-                                "entry": confirm["entry"],
-                                "take_profit": confirm["take_profit"],
-                                "stop_loss": confirm["stop_loss"],
-                                "opened_at": datetime.now().strftime("%Y-%m-%d %H:%M")
-                            }
-                            save_db(db)
-
-                            send_discord(
-                                title=f"⚡ ซิกแนลใหม่: {signal_action} {CONFIG['DISPLAY_NAME']}",
-                                desc="สัญญาณผ่านเงื่อนไข Quant + Gemini Filter",
-                                color=1752220 if signal_action == "BUY" else 15844367,
-                                fields=[
-                                    {"name": "ทิศทาง", "value": f"**{signal_action}**", "inline": True},
-                                    {"name": "ราคาเข้า", "value": f"{confirm['entry']:.2f}", "inline": True},
-                                    {"name": "🎯 Take Profit", "value": f"`{confirm['take_profit']:.2f}`", "inline": True},
-                                    {"name": "🛑 Stop Loss", "value": f"`{confirm['stop_loss']:.2f}`", "inline": True},
-                                    {"name": "Risk:Reward", "value": confirm.get("risk_reward", "1:1.67"), "inline": True},
-                                    {"name": "เหตุผล", "value": confirm.get("reason", "-"), "inline": False},
-                                    {"name": "สถิติพอร์ต", "value": f"ชนะ {db['stats']['wins']} / แพ้ {db['stats']['losses']} (Win Rate: {db['stats']['win_rate']}%)", "inline": False}
-                                ]
-                            )
-        except Exception as e:
-            logger.error(f"Loop error: {e}")
-
-        time.sleep(CONFIG["CHECK_SECONDS"])
+        run_bot_cycle()
+        time.sleep(CONFIG["CHECK_INTERVAL_SEC"])
 
 if __name__ == "__main__":
-    run()
+    main()
