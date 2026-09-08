@@ -13,11 +13,12 @@ from google import genai
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 CONFIG = {
-    "SYMBOL": "GC=F",           # ทองคำ Gold Futures
+    "SYMBOL": "GC=F",           # ทองคำ Gold Futures (XAUUSD)
     "INTERVAL": "15m",          # กรอบเวลา 15 นาที
     "CHECK_INTERVAL_SEC": 300,  # ตรวจสอบกราฟทุก 5 นาที
     "HISTORY_PERIOD": "5d",
-    "MIN_RR_RATIO": 2.0
+    "MIN_RR_RATIO": 2.0,
+    "STATS_FILE": "stats.json"  # บันทึกสถิติลงไฟล์ป้องกันข้อมูลหาย
 }
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -26,8 +27,30 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 active_order = None
-performance_stats = {"wins": 0, "losses": 0, "total": 0}
 last_news_check_date = None
+
+def load_performance_stats():
+    """โหลดสถิติจากไฟล์ JSON หากไม่มีให้สร้างใหม่"""
+    if os.path.exists(CONFIG["STATS_FILE"]):
+        try:
+            with open(CONFIG["STATS_FILE"], "r", encoding="utf-8") as f:
+                stats = json.load(f)
+                logging.info(f"โหลดสถิติเดิมสำเร็จ: {stats}")
+                return stats
+        except Exception as e:
+            logging.error(f"อ่านไฟล์สถิติไม่สำเร็จ: {e}")
+    return {"wins": 0, "losses": 0, "total": 0}
+
+def save_performance_stats(stats):
+    """บันทึกสถิติลงไฟล์ JSON ทันทีเมื่อมีการปิดออเดอร์"""
+    try:
+        with open(CONFIG["STATS_FILE"], "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=4)
+        logging.info("บันทึกสถิติลงไฟล์สำเร็จ")
+    except Exception as e:
+        logging.error(f"บันทึกไฟล์สถิติไม่สำเร็จ: {e}")
+
+performance_stats = load_performance_stats()
 
 def send_discord_message(embed_data):
     """ส่งข้อความ Embed แจ้งเตือนเข้า Discord Webhook"""
@@ -35,7 +58,11 @@ def send_discord_message(embed_data):
         logging.warning("ไม่พบ DISCORD_WEBHOOK_URL")
         return
     try:
-        payload = {"embeds": [embed_data]}
+        payload = {
+            "username": "QUANT ALPHA TERMINAL",
+            "avatar_url": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=150&auto=format&fit=crop&q=80",
+            "embeds": [embed_data]
+        }
         res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
         res.raise_for_status()
     except Exception as e:
@@ -48,7 +75,6 @@ def check_and_send_thai_forex_news():
     now_th = datetime.now(tz_th)
     today_str = now_th.strftime("%Y-%m-%d")
 
-    # ตรวจสอบวันละ 1 ครั้ง
     if last_news_check_date == today_str:
         return
 
@@ -68,18 +94,26 @@ def check_and_send_thai_forex_news():
                     dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
                     dt_th = dt.astimezone(tz_th)
                     if dt_th.strftime("%Y-%m-%d") == today_str:
-                        impact_icon = "🔴 กล่องแดง" if ev.get("impact") == "High" else "🟠 กล่องส้ม"
+                        impact_tag = "🔴 [HIGH IMPACT]" if ev.get("impact") == "High" else "🟠 [MEDIUM]"
                         today_usd_events.append(
-                            f"⏰ **{dt_th.strftime('%H:%M น.')}** | {impact_icon}\n"
-                            f"📌 **{ev.get('title')}** (คาดการณ์: `{ev.get('forecast') or '-'}` / เดิม: `{ev.get('previous') or '-'}`)"
+                            f"`{dt_th.strftime('%H:%M น.')}` **{impact_tag}** {ev.get('title')}\n"
+                            f"└ 📊 *Forecast:* `{ev.get('forecast') or '-'}` │ *Previous:* `{ev.get('previous') or '-'}`"
                         )
 
         if today_usd_events:
             embed = {
-                "title": f"📅 ตารางข่าวเศรษฐกิจสำคัญประจำวันนี้ ({now_th.strftime('%d/%m/%Y')})",
-                "description": "เวลาทั้งหมดถูกแปลงเป็น **เวลาไทย (GMT+7)** เรียบร้อยแล้วครับ\n\n" + "\n\n".join(today_usd_events),
-                "color": 16724787,
-                "footer": {"text": "Forex Factory Calendar • เวลาประเทศไทย (GMT+7)"}
+                "author": {
+                    "name": "ECONOMIC CALENDAR // USD IMPACT RADAR",
+                    "icon_url": "https://cdn-icons-png.flaticon.com/512/3314/3314486.png"
+                },
+                "title": f"📅 กำหนดการข่าวเศรษฐกิจสำคัญ ({now_th.strftime('%d/%m/%Y')})",
+                "description": ">>> ⚠️ **คำเตือนความเสี่ยง:** ตลาดอาจมีความผันผวนสูงและ Spread ถ่างขึ้นในช่วงเวลาข่าวด้านล่าง กรุณาคุมความเสี่ยงอย่างเคร่งครัด\n\n" + "\n\n".join(today_usd_events),
+                "color": 0xFF4500,
+                "footer": {
+                    "text": "Forex Factory Data • Bangkok Time (GMT+7)",
+                    "icon_url": "https://cdn-icons-png.flaticon.com/512/2972/2972531.png"
+                },
+                "timestamp": datetime.now(pytz.utc).isoformat()
             }
             send_discord_message(embed)
             logging.info("ส่งสรุปตารางข่าวเศรษฐกิจเวลาไทยเข้า Discord สำเร็จ")
@@ -131,19 +165,19 @@ def analyze_market_conditions(df):
     bearish_factors = []
 
     if current_price > ema200:
-        bullish_factors.append("เหนือเส้น EMA 200 (Bullish Major Trend)")
+        bullish_factors.append("ราคาอยู่เหนือ EMA 200 (Bullish Major Trend)")
     else:
-        bearish_factors.append("ใต้เส้น EMA 200 (Bearish Major Trend)")
+        bearish_factors.append("ราคาอยู่ใต้ EMA 200 (Bearish Major Trend)")
 
     if ema20 > ema50:
-        bullish_factors.append("EMA 20 > EMA 50 (Golden Cross)")
+        bullish_factors.append("EMA 20 ตัดขึ้นเหนือ EMA 50 (Golden Cross)")
     elif ema20 < ema50:
-        bearish_factors.append("EMA 20 < EMA 50 (Death Cross)")
+        bearish_factors.append("EMA 20 ตัดลงใต้ EMA 50 (Death Cross)")
 
     if 45 <= rsi <= 68:
-        bullish_factors.append(f"RSI แข็งแกร่ง ({rsi:.1f})")
+        bullish_factors.append(f"RSI โมเมนตัมขาขึ้นชัดเจน ({rsi:.1f})")
     elif 32 <= rsi <= 55:
-        bearish_factors.append(f"RSI อ่อนแรง ({rsi:.1f})")
+        bearish_factors.append(f"RSI โมเมนตัมขาลงชัดเจน ({rsi:.1f})")
 
     fvg_type = "None"
     fvg_top = 0.0
@@ -153,14 +187,14 @@ def analyze_market_conditions(df):
         fvg_top = float(b3["Low"])
         fvg_bottom = float(b1["High"])
         if curr["Low"] <= fvg_top and current_price >= fvg_bottom:
-            bullish_factors.append(f"SMC: รีเทสต์ Bullish FVG ({fvg_bottom:.2f} - {fvg_top:.2f})")
+            bullish_factors.append(f"SMC: รีเทสต์โซน Demand FVG ({fvg_bottom:.2f} - {fvg_top:.2f})")
             fvg_type = "Bullish FVG Retest"
 
     elif b1["Low"] > b3["High"]:
         fvg_top = float(b1["Low"])
         fvg_bottom = float(b3["High"])
         if curr["High"] >= fvg_bottom and current_price <= fvg_top:
-            bearish_factors.append(f"SMC: เด้งทดสอบ Bearish FVG ({fvg_bottom:.2f} - {fvg_top:.2f})")
+            bearish_factors.append(f"SMC: เด้งทดสอบโซน Supply FVG ({fvg_bottom:.2f} - {fvg_top:.2f})")
             fvg_type = "Bearish FVG Retest"
 
     if len(bullish_factors) >= 3 and current_price > ema200:
@@ -201,7 +235,7 @@ def gemini_advanced_validation(setup):
         "sl": round(fallback_sl, 2),
         "tp": round(fallback_tp, 2),
         "confidence": "Quant Rule-based",
-        "reason": "SMC & Multi-Indicator Confluence (Auto Calculated)"
+        "reason": "โครงสร้างราคาและ Indicator สอดคล้องตามกลยุทธ์ SMC + Confluence"
     }
 
     if not ai_client:
@@ -228,12 +262,11 @@ def gemini_advanced_validation(setup):
         "entry": {setup['current_price']},
         "sl": 0.0,
         "tp": 0.0,
-        "confidence": "85%",
-        "reason": "สรุปเหตุผลสั้นๆ 1 ประโยค"
+        "confidence": "90%",
+        "reason": "สรุปเหตุผลกระชับ คมชัด สไตล์นักเทรดมืออาชีพ"
     }}
     """
 
-    # ใช้โมเดล gemini-3.6-flash ตามที่ API แจ้ง
     models_to_try = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
     
     for m in models_to_try:
@@ -252,7 +285,6 @@ def gemini_advanced_validation(setup):
             logging.warning(f"เรียกใช้โมเดล {m} ไม่สำเร็จ: {e}")
             continue
 
-    # หาก API ทั้งหมดไม่สามารถใช้งานได้ ให้ใช้ระบบ Quant คำนวณ SL/TP อัตโนมัติทันที
     logging.info("สลับมาใช้ระบบคำนวณ Quant SL/TP อัตโนมัติ")
     return fallback_decision
 
@@ -290,18 +322,46 @@ def check_active_trade(current_price):
         else:
             performance_stats["losses"] += 1
 
+        save_performance_stats(performance_stats)
+
         win_rate = (performance_stats["wins"] / performance_stats["total"]) * 100
+        
+        # ดีไซน์การ์ดผลลัพธ์แบบ Cyberpunk / Quant Terminal
+        is_win = (outcome == "WIN")
+        embed_color = 0x00FFA3 if is_win else 0xFF2A6D
+        status_banner = "🎯 [TRADE TARGET HIT // PROFIT LOCKED]" if is_win else "🛑 [STOP LOSS TRIGGERED // RISK MITIGATED]"
+        pnl_sign = "+" if pnl > 0 else ""
+        
         embed = {
-            "title": f"{'🎯 ปิดกำไรเรียบร้อย (WIN) 🚀' if outcome == 'WIN' else '🛑 ตัดขาดทุน (SL Hit)'}",
-            "color": 3066993 if outcome == "WIN" else 15158332,
+            "author": {
+                "name": "TRADE EXECUTION MONITOR // ORDER CLOSED",
+                "icon_url": "https://cdn-icons-png.flaticon.com/512/2620/2620604.png"
+            },
+            "title": status_banner,
+            "description": f"```diff\n{'+' if is_win else '-'} RESULT: {outcome} ({side} ORDER)\n{'+' if is_win else '-'} PnL: {pnl_sign}{pnl:.2f} PTS ({pnl_sign}{int(pnl*10)} PIPS)\n```",
+            "color": embed_color,
             "fields": [
-                {"name": "ออเดอร์", "value": f"`{side}`", "inline": True},
-                {"name": "กำไร/ขาดทุน", "value": f"`{pnl:+} จุด`", "inline": True},
-                {"name": "ราคาปิด", "value": f"`{current_price}`", "inline": True},
-                {"name": "สถิติสะสม", "value": f"🏆 ชนะ: {performance_stats['wins']} | ❌ แพ้: {performance_stats['losses']}", "inline": False},
-                {"name": "📊 Win Rate รวม", "value": f"`{win_rate:.1f}%` (จากทั้งหมด {performance_stats['total']} ไม้)", "inline": False}
+                {
+                    "name": "📌 รายละเอียดราคา",
+                    "value": f"• จุดเข้า: `{entry:.2f}`\n• จุดปิด: `{current_price:.2f}`",
+                    "inline": True
+                },
+                {
+                    "name": "🏆 ผลงานสะสม",
+                    "value": f"• ชนะ: `{performance_stats['wins']}` ไม้\n• แพ้: `{performance_stats['losses']}` ไม้",
+                    "inline": True
+                },
+                {
+                    "name": "📈 WIN RATE สะสม",
+                    "value": f"```ansi\n\u001b[1;32m{win_rate:.1f}%\u001b[0m (จากทั้งหมด {performance_stats['total']} ไม้)\n```",
+                    "inline": False
+                }
             ],
-            "footer": {"text": "Hybrid Quant Engine • SMC + FVG + Indicators"}
+            "footer": {
+                "text": "QUANT ALPHA ENGINE • SMC & FVG AUTOMATION",
+                "icon_url": "https://cdn-icons-png.flaticon.com/512/1006/1006771.png"
+            },
+            "timestamp": datetime.now(pytz.utc).isoformat()
         }
         send_discord_message(embed)
         active_order = None
@@ -339,22 +399,69 @@ def run_bot_cycle():
         active_order = decision
         win_rate = (performance_stats["wins"] / performance_stats["total"] * 100) if performance_stats["total"] > 0 else 0.0
 
-        factors_text = "\n".join([f"• {f}" for f in setup["factors"]])
+        is_buy = decision["action"] == "BUY"
+        embed_color = 0x00F0FF if is_buy else 0xFF0055  # Neon Cyan สำหรับ BUY / Neon Crimson สำหรับ SELL
+        side_icon = "🟢 BUY LONG" if is_buy else "🔴 SELL SHORT"
+        
+        # คำนวณระยะ SL และ TP เป็นจุด
+        sl_points = abs(decision["entry"] - decision["sl"])
+        tp_points = abs(decision["tp"] - decision["entry"])
+        rr_ratio = (tp_points / sl_points) if sl_points > 0 else 2.0
+
+        # จัดข้อความยืนยัน Confluence แบบล้ำๆ
+        factors_formatted = "\n".join([f"├ ⚡ {f}" for f in setup["factors"][:-1]])
+        if setup["factors"]:
+            factors_formatted += f"\n└ ⚡ {setup['factors'][-1]}"
+
         embed = {
-            "title": f"⚡ ซิกแนลใหม่: {decision['action']} XAUUSD (Multi-System Hybrid)",
-            "description": f"**เหตุผลวิเคราะห์:** {decision.get('reason', 'SMC + Technical Confluence')}\n**ความมั่นใจ:** `{decision.get('confidence', 'Normal')}`",
-            "color": 3447003 if decision['action'] == "BUY" else 15105570,
+            "author": {
+                "name": "QUANT TRADING ENGINE // AI ALPHA SIGNAL",
+                "icon_url": "https://cdn-icons-png.flaticon.com/512/2091/2091665.png"
+            },
+            "title": f"⚡ NEW SIGNAL: {side_icon} (XAUUSD / M15)",
+            "description": (
+                f">>> **กลยุทธ์:** `SMC + Multi-Confluence Matrix`\n"
+                f"**เหตุผลการเข้า:** {decision.get('reason', 'ตรวจพบการบรรจบกันของโครงสร้างราคาและตัวชี้วัด')}\n"
+                f"**ระดับความมั่นใจ:** `{decision.get('confidence', 'HIGH')}`"
+            ),
+            "color": embed_color,
             "fields": [
-                {"name": "จุดเข้า (Entry)", "value": f"`{decision['entry']}`", "inline": True},
-                {"name": "🛑 Stop Loss (SL)", "value": f"`{decision['sl']}`", "inline": True},
-                {"name": "🎯 Take Profit (TP)", "value": f"`{decision['tp']}`", "inline": True},
-                {"name": "สัญญาณยืนยันร่วม (Confluence)", "value": factors_text, "inline": False},
-                {"name": "สถิติสะสม", "value": f"ชนะ {performance_stats['wins']} / แพ้ {performance_stats['losses']} (Win Rate: {win_rate:.1f}%)", "inline": False}
+                {
+                    "name": "🎯 แผนราคา (Trade Parameters)",
+                    "value": (
+                        f"```yaml\n"
+                        f"ENTRY : {decision['entry']:.2f}\n"
+                        f"SL    : {decision['sl']:.2f} (-{sl_points:.1f} pts)\n"
+                        f"TP    : {decision['tp']:.2f} (+{tp_points:.1f} pts)\n"
+                        f"R:R   : 1:{rr_ratio:.1f}\n"
+                        f"```"
+                    ),
+                    "inline": False
+                },
+                {
+                    "name": "🔬 ปัจจัยยืนยันร่วม (Confluence Factors)",
+                    "value": factors_formatted,
+                    "inline": False
+                },
+                {
+                    "name": "📊 สถิติระบบบอท",
+                    "value": f"`WIN RATE: {win_rate:.1f}%` │ ชนะ `{performance_stats['wins']}` / แพ้ `{performance_stats['losses']}`",
+                    "inline": True
+                },
+                {
+                    "name": "🛡️ แนะนำความเสี่ยง",
+                    "value": "`1 - 2% ของพอร์ต`",
+                    "inline": True
+                }
             ],
-            "footer": {"text": "SMC • FVG • EMA 200/50/20 • RSI • Gemini Flash"}
+            "footer": {
+                "text": "Gemini AI Flash • SMC Liquidity Engine • Timeframe 15M",
+                "icon_url": "https://cdn-icons-png.flaticon.com/512/2586/2586057.png"
+            },
+            "timestamp": datetime.now(pytz.utc).isoformat()
         }
         send_discord_message(embed)
-        logging.info(f"ส่งซิกแนล {decision['action']} เข้า Discord เรียบร้อย!")
+        logging.info(f"ส่งซิกแนล {decision['action']} เข้า Discord แบบ High-Tech เรียบร้อย!")
 
     except Exception as e:
         logging.error(f"รอบการทำงานผิดพลาด: {e}")
