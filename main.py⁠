@@ -104,7 +104,7 @@ class CFG:
     STATS_FILE = os.getenv("STATS_FILE", "stats.json")
     TRADES_FILE = os.getenv("TRADES_FILE", "active_trades.json")
 
-    # ---------- Web Server (ดึง $PORT ของ Render ก่อนเสมอ) ----------
+    # ---------- Web Server ----------
     PORT = int(os.getenv("PORT", "10000"))
 
     # ---------- Gold Conversion ----------
@@ -1151,7 +1151,7 @@ class TradeManager:
 
 
 # ==========================================================================================
-# SECTION 6.4 : KEEP-ALIVE WEB SERVER (แก้ปัญหา Address already in use)
+# SECTION 6.4 : KEEP-ALIVE WEB SERVER (แก้ปัญหา Port In Use อย่างถาวร)
 # ==========================================================================================
 BOT_STATE = {
     "status": "starting",
@@ -1165,7 +1165,6 @@ BOT_STATE = {
 
 
 class ReusableHTTPServer(HTTPServer):
-    """เปิดใช้ SO_REUSEADDR ป้องกัน [Errno 98] Address already in use เมื่อรีสตาร์ท"""
     allow_reuse_address = True
 
 
@@ -1209,16 +1208,29 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 
 
+def is_port_in_use(port: int) -> bool:
+    """ตรวจสอบว่าพอร์ตนี้มีเซิร์ฟเวอร์เปิดทำงานอยู่แล้วหรือไม่"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 def start_web_server() -> None:
     def _run():
+        if is_port_in_use(CFG.PORT):
+            log.info(f"[Web] พอร์ต {CFG.PORT} มีเซิร์ฟเวอร์เปิดรับ Ping อยู่แล้ว — ข้ามการเปิดซ้ำและเข้าสู่ลูปเทรด")
+            return
+
         while True:
             try:
                 srv = ReusableHTTPServer(("0.0.0.0", CFG.PORT), HealthHandler)
                 log.info(f"[Web] Keep-Alive Server พร้อมทำงานที่พอร์ต {CFG.PORT}")
                 srv.serve_forever()
             except Exception as e:
+                if is_port_in_use(CFG.PORT):
+                    log.info(f"[Web] พอร์ต {CFG.PORT} ถูกใช้งานแล้ว ปล่อยให้ระบบทำงานต่อ")
+                    break
                 log.warning(f"[Web] Server รอรีสตาร์ท: {e}")
-                time.sleep(5)
+                time.sleep(10)
 
     threading.Thread(target=_run, daemon=True, name="WebServer").start()
 
