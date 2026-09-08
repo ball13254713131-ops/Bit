@@ -53,14 +53,13 @@ def save_performance_stats(stats):
 performance_stats = load_performance_stats()
 
 def send_discord_message(embed_data):
-    """ส่งข้อความ Embed แจ้งเตือนเข้า Discord Webhook"""
+    """ส่งข้อความ Embed แจ้งเตือนเข้า Discord Webhook โดยใช้รูปและชื่อโปรไฟล์ที่ตั้งไว้ใน Discord โดยตรง"""
     if not DISCORD_WEBHOOK_URL:
         logging.warning("ไม่พบ DISCORD_WEBHOOK_URL")
         return
     try:
+        # นำ avatar_url ออกเพื่อให้ Discord ดึงรูปโปรไฟล์ที่คุณตั้งไว้ในแอปมาแสดงผล
         payload = {
-            "username": "QUANT ALPHA TERMINAL",
-            "avatar_url": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=150&auto=format&fit=crop&q=80",
             "embeds": [embed_data]
         }
         res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
@@ -267,7 +266,7 @@ def gemini_advanced_validation(setup):
     }}
     """
 
-    models_to_try = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
     
     for m in models_to_try:
         try:
@@ -408,7 +407,7 @@ def run_bot_cycle():
         tp_points = abs(decision["tp"] - decision["entry"])
         rr_ratio = (tp_points / sl_points) if sl_points > 0 else 2.0
 
-        # จัดข้อความยืนยัน Confluence แบบล้ำๆ
+        # จัดข้อความยืนยัน Confluence แบบ Tree Structure
         factors_formatted = "\n".join([f"├ ⚡ {f}" for f in setup["factors"][:-1]])
         if setup["factors"]:
             factors_formatted += f"\n└ ⚡ {setup['factors'][-1]}"
