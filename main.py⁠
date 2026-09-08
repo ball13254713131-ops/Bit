@@ -1,0 +1,261 @@
+import os
+import sys
+import time
+import json
+import logging
+from datetime import datetime
+from typing import Dict, Any, Optional
+
+import requests
+import yfinance as yf
+import pandas as pd
+from google import genai
+from google.genai import types
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("quant_bot.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("QuantTracker")
+
+CONFIG = {
+    "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
+    "DISCORD_WEBHOOK_URL": os.getenv("DISCORD_WEBHOOK_URL", ""),
+    "SYMBOL": "GC=F",
+    "DISPLAY_NAME": "XAUUSD (Gold)",
+    "INTERVAL": "15m",
+    "CHECK_SECONDS": 300,
+    "DB_FILE": "quant_trade_history.json"
+}
+
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    high_low = df['High'] - df['Low']
+    high_close = (df['High'] - df['Close'].shift()).abs()
+    low_close = (df['Low'] - df['Close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR'] = tr.rolling(window=14).mean()
+    return df
+
+def evaluate_quant_setup(df: pd.DataFrame) -> Optional[str]:
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    price = last['Close']
+    ema200 = last['EMA_200']
+    ema20 = last['EMA_20']
+    ema50 = last['EMA_50']
+    rsi = last['RSI']
+
+    if price > ema200 and ema20 > ema50 and 45 < rsi < 68:
+        if prev['EMA_20'] <= prev['EMA_50'] or price > last['EMA_20']:
+            return "BUY"
+
+    if price < ema200 and ema20 < ema50 and 32 < rsi < 55:
+        if prev['EMA_20'] >= prev['EMA_50'] or price < last['EMA_20']:
+            return "SELL"
+
+    return None
+
+def load_db() -> Dict[str, Any]:
+    if not os.path.exists(CONFIG["DB_FILE"]):
+        data = {
+            "stats": {"total": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "pnl_points": 0.0},
+            "active_signal": None,
+            "closed": []
+        }
+        with open(CONFIG["DB_FILE"], "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        return data
+    with open(CONFIG["DB_FILE"], "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_db(data: Dict[str, Any]):
+    with open(CONFIG["DB_FILE"], "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+def send_discord(title: str, desc: str, color: int, fields: list):
+    url = CONFIG["DISCORD_WEBHOOK_URL"]
+    if not url:
+        return
+    payload = {
+        "embeds": [{
+            "title": title,
+            "description": desc,
+            "color": color,
+            "fields": fields,
+            "footer": {"text": "Gemini Quant AI System"}
+        }]
+    }
+    try:
+        requests.post(url, json=payload, timeout=8)
+    except Exception as e:
+        logger.error(f"Discord error: {e}")
+
+def get_gemini_confirmation(action: str, current_price: float, atr: float) -> Dict[str, Any]:
+    client = genai.Client(api_key=CONFIG["GEMINI_API_KEY"])
+    sl_dist = round(atr * 1.5, 2)
+    tp_dist = round(atr * 2.5, 2)
+
+    if action == "BUY":
+        calc_sl = round(current_price - sl_dist, 2)
+        calc_tp = round(current_price + tp_dist, 2)
+    else:
+        calc_sl = round(current_price + sl_dist, 2)
+        calc_tp = round(current_price - tp_dist, 2)
+
+    prompt = f"""
+วิเคราะห์จุดเข้าเทรด Quant Setup:
+- สินทรัพย์: {CONFIG['DISPLAY_NAME']}
+- สัญญาณ: {action}
+- ราคาปัจจุบัน: {current_price:.2f}
+- แนะนำ SL: {calc_sl}
+- แนะนำ TP: {calc_tp}
+
+ตรวจสอบความสมเหตุสมผลและตอบกลับเป็น JSON เท่านั้น:
+{{
+  "approved": true,
+  "action": "{action}",
+  "entry": {current_price:.2f},
+  "stop_loss": {calc_sl},
+  "take_profit": {calc_tp},
+  "risk_reward": "1:1.67",
+  "reason": "เหตุผลสั้นๆ 1-2 บรรทัด"
+}}
+"""
+    try:
+        res = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+        )
+        return json.loads(res.text)
+    except Exception as e:
+        logger.error(f"Gemini API Error: {e}")
+        return {"approved": False}
+
+def check_win_loss(high: float, low: float):
+    db = load_db()
+    sig = db.get("active_signal")
+    if not sig:
+        return
+
+    action = sig["action"]
+    entry = sig["entry"]
+    tp = sig["take_profit"]
+    sl = sig["stop_loss"]
+
+    outcome = None
+    exit_p = 0.0
+
+    if action == "BUY":
+        if high >= tp:
+            outcome = "WIN"
+            exit_p = tp
+        elif low <= sl:
+            outcome = "LOSS"
+            exit_p = sl
+    elif action == "SELL":
+        if low <= tp:
+            outcome = "WIN"
+            exit_p = tp
+        elif high >= sl:
+            outcome = "LOSS"
+            exit_p = sl
+
+    if outcome:
+        pts = abs(exit_p - entry) if outcome == "WIN" else -abs(exit_p - entry)
+        stats = db["stats"]
+        stats["total"] += 1
+        if outcome == "WIN":
+            stats["wins"] += 1
+        else:
+            stats["losses"] += 1
+
+        stats["win_rate"] = round((stats["wins"] / stats["total"]) * 100, 2)
+        stats["pnl_points"] = round(stats["pnl_points"] + pts, 2)
+
+        db["closed"].append({
+            "action": action, "entry": entry, "exit": exit_p,
+            "outcome": outcome, "points": pts, "closed_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+        })
+        db["active_signal"] = None
+        save_db(db)
+
+        color = 3066993 if outcome == "WIN" else 15158332
+        send_discord(
+            title=f"🎯 สรุปผลซิกแนล: {'ชนะ (WIN) 🎉' if outcome == 'WIN' else 'แพ้ (LOSS) ❌'}",
+            desc=f"ออเดอร์ **{action} {CONFIG['DISPLAY_NAME']}** ปิดเรียบร้อยแล้ว",
+            color=color,
+            fields=[
+                {"name": "ผลลัพธ์", "value": f"**{outcome}** ({pts:+.2f} pts)", "inline": True},
+                {"name": "เข้า / ออก", "value": f"{entry:.2f} ➔ {exit_p:.2f}", "inline": True},
+                {"name": "สถิติสะสม", "value": f"🏆 ชนะ: **{stats['wins']}** | ❌ แพ้: **{stats['losses']}**", "inline": False},
+                {"name": "📊 Win Rate รวม", "value": f"**{stats['win_rate']}%** (จาก {stats['total']} ไม้)", "inline": False}
+            ]
+        )
+
+def run():
+    logger.info("Hybrid Quant Bot Started...")
+    while True:
+        try:
+            ticker = yf.Ticker(CONFIG["SYMBOL"])
+            df = ticker.history(interval=CONFIG["INTERVAL"], period="5d")
+
+            if not df.empty and len(df) > 200:
+                df = calculate_indicators(df)
+                last_high = float(df['High'].iloc[-1])
+                last_low = float(df['Low'].iloc[-1])
+                curr_price = float(df['Close'].iloc[-1])
+                atr = float(df['ATR'].iloc[-1])
+
+                check_win_loss(last_high, last_low)
+
+                db = load_db()
+                if db.get("active_signal") is None:
+                    signal_action = evaluate_quant_setup(df)
+                    if signal_action:
+                        confirm = get_gemini_confirmation(signal_action, curr_price, atr)
+                        if confirm.get("approved"):
+                            db["active_signal"] = {
+                                "action": signal_action,
+                                "entry": confirm["entry"],
+                                "take_profit": confirm["take_profit"],
+                                "stop_loss": confirm["stop_loss"],
+                                "opened_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+                            }
+                            save_db(db)
+
+                            send_discord(
+                                title=f"⚡ ซิกแนลใหม่: {signal_action} {CONFIG['DISPLAY_NAME']}",
+                                desc="สัญญาณผ่านเงื่อนไข Quant + Gemini Filter",
+                                color=1752220 if signal_action == "BUY" else 15844367,
+                                fields=[
+                                    {"name": "ทิศทาง", "value": f"**{signal_action}**", "inline": True},
+                                    {"name": "ราคาเข้า", "value": f"{confirm['entry']:.2f}", "inline": True},
+                                    {"name": "🎯 Take Profit", "value": f"`{confirm['take_profit']:.2f}`", "inline": True},
+                                    {"name": "🛑 Stop Loss", "value": f"`{confirm['stop_loss']:.2f}`", "inline": True},
+                                    {"name": "Risk:Reward", "value": confirm.get("risk_reward", "1:1.67"), "inline": True},
+                                    {"name": "เหตุผล", "value": confirm.get("reason", "-"), "inline": False},
+                                    {"name": "สถิติพอร์ต", "value": f"ชนะ {db['stats']['wins']} / แพ้ {db['stats']['losses']} (Win Rate: {db['stats']['win_rate']}%)", "inline": False}
+                                ]
+                            )
+        except Exception as e:
+            logger.error(f"Loop error: {e}")
+
+        time.sleep(CONFIG["CHECK_SECONDS"])
+
+if __name__ == "__main__":
+    run()
