@@ -1,28 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-==================================================================================================
- INSTITUTIONAL GOLD SMC V7.6.1 — DISCORD LIVE SIGNAL & HEALTH SERVER EDITION
-==================================================================================================
- Upgrades in V7.6.1 Live Dispatcher:
-   1. REAL-TIME DISCORD WEBHOOK INTEGRATION: Automatically formats and dispatches institutional
-      setup notifications (BUY/SELL signals, entry parameters, SL/TP levels, and risk metrics).
-   2. EMBEDDED HTTP HEALTH CHECK SERVER: Runs a lightweight background web server on $PORT using 
-      ReusableHTTPServer to prevent [Errno 98] Address already in use errors on Render/Railway.
-   3. 16 INVARIANT SUITES: Preserves strict no-lookahead, causality, and CME daily session rollover checks.
-==================================================================================================
+==========================================================================================
+ INSTITUTIONAL SPOT GOLD (XAUUSD) SMC TRADING BOT — PRODUCTION SINGLE-FILE (24/7 MODE)
+==========================================================================================
+ สถาปัตยกรรม 6 ชั้น (ปรับปรุงให้เทรดได้ 24 ชั่วโมง / ทุกวัน):
+   [Layer 1] Market Data Feed (PAXG-USD) + Multi-Timeframe (H1 Bias / M15 Execution)
+   [Layer 2] Time & Volatility Filter (24/7 Active Mode, Asia/Bangkok GMT+7)
+   [Layer 3] Institutional SMC Logic (Premium/Discount, Liquidity Sweep, FVG, Momentum)
+   [Layer 4] News Blackout Engine (Forex Factory Weekly JSON, USD High Impact)
+   [Layer 5] Advanced AI Brain (Chain-of-Thought Validation: Gemini / Claude + Fallback)
+   [Layer 6] Discord Alert + Performance Tracker + 24/7 Keep-Alive Web Server
+==========================================================================================
 """
 
-import sys
 import os
-import math
+import sys
+import json
 import time
-import logging
-import itertools
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone, timedelta, time as dtime
-from typing import List, Dict, Any, Optional, Tuple, Set
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import math
+import socket
 import threading
+import logging
+import traceback
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytz
 import requests
@@ -31,770 +32,1306 @@ import pandas as pd
 
 try:
     import yfinance as yf
-except ImportError:
-    print("Error: Missing dependencies. Run: pip install yfinance pandas numpy pytz requests")
-    sys.exit(1)
+except Exception as _e:
+    print("ต้องติดตั้ง yfinance ก่อน: pip install yfinance")
+    raise
 
+
+# ==========================================================================================
+# SECTION 0 : CONFIGURATION (อ่านค่าจาก Environment Variables ของ Render)
+# ==========================================================================================
+class CFG:
+    # ---------- Asset & Timeframes ----------
+    SYMBOL = os.getenv("SYMBOL", "PAXG-USD")   # Spot Gold 1:1 (London Benchmark) ไม่มีพรีเมียมฟิวเจอร์ส
+    HTF_INTERVAL = "60m"                        # Higher Timeframe = H1 (Directional Bias)
+    LTF_INTERVAL = "15m"                        # Lower Timeframe  = M15 (Execution)
+    HTF_PERIOD = "60d"                          # ช่วงข้อมูลย้อนหลังสำหรับ H1 (พอสำหรับ EMA200)
+    LTF_PERIOD = "20d"                          # ช่วงข้อมูลย้อนหลังสำหรับ M15
+    SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "300"))   # สแกนทุก 5 นาที
+
+    # ---------- Timezone ----------
+    TZ_NAME = "Asia/Bangkok"
+    TZ = pytz.timezone("Asia/Bangkok")
+
+    # ---------- Killzones & Trading Schedule (24/7 Mode) ----------
+    KILLZONES = [
+        {"name": "SESSION_24H", "start": (0, 0), "end": (23, 59)},
+    ]
+    TRADE_WEEKDAYS = {0, 1, 2, 3, 4, 5, 6}   # จันทร์ - อาทิตย์ (เปิดเทรดทุกวัน)
+
+    # ---------- SMC Parameters ----------
+    HTF_SWING_LOOKBACK = 20      # H1 Swing สำหรับ Premium/Discount
+    LTF_SWING_LOOKBACK = 30      # M15 มองหา Liquidity Pool
+    SWEEP_WINDOW = 6             # ตรวจ Sweep ภายใน 6 แท่งล่าสุด (M15)
+    FVG_SCAN_BARS = 25           # สแกนหา FVG ย้อนหลัง (M15)
+    FVG_MIN_SIZE_ATR = 0.15      # FVG ต้องมีขนาดอย่างน้อย 15% ของ ATR
+    EMA_PERIOD = 200             # EMA 200 บน H1
+    RSI_PERIOD = 14
+    ATR_PERIOD = 14
+    RSI_BUY_RANGE = (45.0, 65.0)
+    RSI_SELL_RANGE = (35.0, 55.0)
+    EQ_BUFFER = 0.02             # Buffer 50% Equilibrium
+
+    # ---------- Risk ----------
+    MIN_RR = float(os.getenv("MIN_RR", "2.0"))       # บังคับ R:R ขั้นต่ำ 1:2.0
+    SL_ATR_BUFFER = 1.2                              # Fallback SL = Swing + 1.2 * ATR
+    MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", "2"))
+    SIGNAL_COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MIN", "45"))
+    ACCOUNT_RISK_USD = float(os.getenv("ACCOUNT_RISK_USD", "100"))
+
+    # ---------- News Blackout ----------
+    FF_CALENDAR_URL = os.getenv(
+        "FF_CALENDAR_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    )
+    NEWS_BLACKOUT_BEFORE_MIN = int(os.getenv("NEWS_BLACKOUT_BEFORE_MIN", "30"))
+    NEWS_BLACKOUT_AFTER_MIN = int(os.getenv("NEWS_BLACKOUT_AFTER_MIN", "30"))
+    NEWS_REFRESH_SEC = 3600 * 6   # รีเฟรชปฏิทินข่าวทุก 6 ชั่วโมง
+
+    # ---------- AI Brain ----------
+    AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
+    CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+    AI_TIMEOUT = int(os.getenv("AI_TIMEOUT", "30"))
+
+    # ---------- Discord ----------
+    DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK", "")
+    HEARTBEAT_HOURS = int(os.getenv("HEARTBEAT_HOURS", "3"))
+
+    # ---------- Persistence ----------
+    STATS_FILE = os.getenv("STATS_FILE", "stats.json")
+    TRADES_FILE = os.getenv("TRADES_FILE", "active_trades.json")
+
+    # ---------- Web Server ----------
+    PORT = int(os.getenv("PORT", "10000"))
+
+    # ---------- Gold Conversion ----------
+    POINT_VALUE = 0.01
+    PIP_VALUE = 0.10
+
+
+# ==========================================================================================
+# SECTION 0.1 : LOGGING & UTILS
+# ==========================================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("SMC_V7_6_1_Discord_Bot")
+log = logging.getLogger("XAUUSD-SMC")
+FILE_LOCK = threading.Lock()
 
 
-# ==================================================================================================
-# 1. CONFIGURATION & SPECIFICATIONS
-# ==================================================================================================
-class BT_CFG:
-    DATA_INSTRUMENT_TYPE: str = "SYNTHETIC_100OZ_PROXY_ON_COMEX_GC"
-    BENCHMARK: str = "GC=F"
-    HTF_INTERVAL: str = "60m"
-    LTF_INTERVAL: str = "15m"
-    INTRABAR_INTERVAL: str = "1m"
-
-    # Cloud & Discord Webhook Config
-    PORT: int = int(os.getenv("PORT", "10000"))
-    DISCORD_WEBHOOK: str = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK", "")
-    SIGNAL_CHECK_INTERVAL_SEC: int = 300  # Scan every 5 minutes
-
-    RESEARCH_CUTOFF_UTC: Optional[str] = None
-    SOURCE_INTRADAY_TIMESTAMP_IS_BAR_START: bool = True
-    TRADING_DATE_TZ: str = "America/New_York"
-    DAILY_ROLLOVER_HOUR_NY: int = 17
-
-    CONTRACT_SIZE: float = 100.0
-    TICK_SIZE: float = 0.01
-    SPREAD_USD: float = 0.25
-    ADVERSE_SLIPPAGE_USD: float = 0.05
-    COMMISSION_ROUND_TRIP: float = 7.0
-    MIN_LOT: float = 0.01
-    MAX_LOT: float = 50.0
-    LOT_STEP: float = 0.01
-
-    INITIAL_CAPITAL: float = 10000.0
-    RISK_PCT: float = 1.0
-    MIN_RR: float = 2.0
-    EQUAL_LEVEL_TOLERANCE: float = 0.0003
-    AMBIGUOUS_EXIT_POLICY: str = "SL_FIRST"
-
-    FRACTAL_CONFIRM_BARS: int = 3
-    MAX_SWEEP_TO_MSS_BARS: int = 4
-    MAX_MSS_TO_DISP_BARS: int = 2
-    MAX_DISP_TO_FVG_BARS: int = 3
-    MAX_FVG_TO_RETEST_BARS: int = 8
-    EXPECTED_ASIAN_M15_BARS: int = 24
-    EXPECTED_DAILY_M15_BARS: int = 92
+def now_th() -> datetime:
+    return datetime.now(CFG.TZ)
 
 
-# ==================================================================================================
-# 2. DISCORD NOTIFICATION ENGINE
-# ==================================================================================================
-class DiscordNotifier:
+def fmt_th(dt: datetime) -> str:
+    if dt is None:
+        return "-"
+    if dt.tzinfo is None:
+        dt = CFG.TZ.localize(dt)
+    return dt.astimezone(CFG.TZ).strftime("%d/%m/%Y %H:%M:%S")
+
+
+def safe_float(x, default=0.0) -> float:
+    try:
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+# ==========================================================================================
+# SECTION 1 : MARKET DATA FEED & MULTI-TIMEFRAME ANALYSIS
+# ==========================================================================================
+class MarketDataFeed:
     def __init__(self):
-        self.webhook = BT_CFG.DISCORD_WEBHOOK
+        self._cache = {}
+        self._cache_ts = {}
 
-    def send(self, embed: Dict[str, Any], content: str = ""):
-        if not self.webhook:
-            logger.warning("[Discord] Webhook URL not set! Please configure DISCORD_WEBHOOK_URL environment variable.")
-            return
+    def _download(self, interval: str, period: str, retries: int = 3) -> pd.DataFrame:
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                tkr = yf.Ticker(CFG.SYMBOL)
+                df = tkr.history(period=period, interval=interval, auto_adjust=False)
+                if df is None or df.empty:
+                    raise ValueError("ได้ DataFrame ว่างเปล่าจาก yfinance")
+
+                df = df.rename(columns={c: c.capitalize() for c in df.columns})
+                need = ["Open", "High", "Low", "Close"]
+                for c in need:
+                    if c not in df.columns:
+                        raise ValueError(f"ไม่พบคอลัมน์ {c} ในข้อมูลที่ได้")
+
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize("UTC")
+                df.index = df.index.tz_convert(CFG.TZ)
+
+                df = df[~df.index.duplicated(keep="last")]
+                df = df.dropna(subset=need).sort_index()
+
+                if len(df) < 30:
+                    raise ValueError(f"ข้อมูลน้อยเกินไป ({len(df)} แท่ง)")
+
+                return df
+            except Exception as e:
+                last_err = e
+                log.warning(f"[DataFeed] ดึงข้อมูล {interval} ล้มเหลว (ครั้งที่ {attempt}/{retries}): {e}")
+                time.sleep(2 * attempt)
+        log.error(f"[DataFeed] ดึงข้อมูล {interval} ไม่สำเร็จ: {last_err}")
+        return pd.DataFrame()
+
+    def get_htf(self) -> pd.DataFrame:
+        return self._download(CFG.HTF_INTERVAL, CFG.HTF_PERIOD)
+
+    def get_ltf(self) -> pd.DataFrame:
+        return self._download(CFG.LTF_INTERVAL, CFG.LTF_PERIOD)
+
+    def get_live_price(self) -> float:
+        key = "live"
+        if key in self._cache and (time.time() - self._cache_ts.get(key, 0)) < 20:
+            return self._cache[key]
         try:
-            requests.post(self.webhook, json={"embeds": [embed], "content": content}, timeout=10)
+            tkr = yf.Ticker(CFG.SYMBOL)
+            fi = getattr(tkr, "fast_info", None)
+            price = None
+            if fi:
+                price = safe_float(fi.get("last_price") if isinstance(fi, dict) else getattr(fi, "last_price", 0.0))
+            if not price:
+                d = tkr.history(period="1d", interval="1m")
+                if d is not None and not d.empty:
+                    price = safe_float(d["Close"].iloc[-1], 0.0)
+            if price:
+                self._cache[key] = price
+                self._cache_ts[key] = time.time()
+                return price
         except Exception as e:
-            logger.error(f"[Discord] Send error: {e}")
-
-    def notify_startup(self):
-        embed = {
-            "title": "🟢 SMC QUANT BOT ONLINE // V7.6.1 DISCORD EDITION",
-            "description": "Institutional Spot Gold (XAUUSD) Causal SMC Signal monitor is active 24/7.",
-            "color": 0x00FFA3,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        self.send(embed, "@here 🚀 **Institutional SMC Bot Started Successfully**")
-
-    def notify_signal(self, setup: Dict[str, Any], session: str):
-        direction = setup["direction"]
-        is_buy = direction == "BUY"
-        embed = {
-            "title": f"⚡ {'BUY LONG' if is_buy else 'SELL SHORT'} SIGNAL // XAUUSD V7.6.1",
-            "description": f"**Session Killzone:** `{session}`\n**Analysis:** Causal Liquidity Sweep, MSS, Displacement & FVG Retest Confirmed.",
-            "color": 0x00F0FF if is_buy else 0xFF0055,
-            "fields": [
-                {
-                    "name": "📊 Execution Parameters",
-                    "value": f"```yaml\nENTRY  : {setup['entry']:.2f}\nSL     : {setup['sl']:.2f}\nTP     : {setup['tp']:.2f}\nLOT    : {setup['lot']}\nRISK   : ${setup['risk_usd']:,.2f}\n```"
-                }
-            ],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        self.send(embed, "@here 📢 **New Institutional SMC Signal Dispatched**")
+            log.warning(f"[DataFeed] ดึงราคา live ไม่สำเร็จ: {e}")
+        return self._cache.get(key, 0.0)
 
 
-# ==================================================================================================
-# 3. CAUSAL DATA STRUCTURES & DISCRETE EVENT OBJECTS
-# ==================================================================================================
-@dataclass
-class CausalLevel:
-    level_type: str
-    price: float
-    formation_time: datetime
-    confirmed_time: datetime
-
-
-@dataclass
-class SweepEvent:
-    timestamp: datetime
-    bar_index: int
-    direction: str
-    level_price: float
-    level_type: str
-    extreme_price: float
-
-
-@dataclass
-class MSSEvent:
-    timestamp: datetime
-    bar_index: int
-    struct_level: float
-    break_price: float
-
-
-@dataclass
-class DisplacementEvent:
-    timestamp: datetime
-    bar_index: int
-    body_ratio: float
-    range_atr_ratio: float
-
-
-@dataclass
-class FVGStructure:
-    created_time: datetime
-    confirmed_time: datetime
-    bar_index: int
-    direction: str
-    top: float
-    bottom: float
-    size: float
-
-
-# ==================================================================================================
-# 4. QUANTITATIVE INDICATORS & DATA NORMALIZATION
-# ==================================================================================================
-class CausalIndicators:
+# ==========================================================================================
+# SECTION 1.1 : TECHNICAL INDICATORS
+# ==========================================================================================
+class Indicators:
     @staticmethod
     def ema(series: pd.Series, period: int) -> pd.Series:
         return series.ewm(span=period, adjust=False).mean()
 
     @staticmethod
+    def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+        delta = series.diff()
+        gain = delta.clip(lower=0.0)
+        loss = -delta.clip(upper=0.0)
+        avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        out = 100 - (100 / (1 + rs))
+        return out.fillna(50.0)
+
+    @staticmethod
     def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        h, l, c = df["High"], df["Low"], df["Close"]
-        pc = c.shift(1)
-        tr = pd.concat([(h - l), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-        return tr.ewm(alpha=1.0 / period, adjust=False).mean()
+        high, low, close = df["High"], df["Low"], df["Close"]
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+        ).max(axis=1)
+        return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def get_research_cutoff_utc() -> datetime:
-    if BT_CFG.RESEARCH_CUTOFF_UTC:
-        return datetime.fromisoformat(BT_CFG.RESEARCH_CUTOFF_UTC.replace("Z", "+00:00")).astimezone(timezone.utc)
-    return datetime.now(timezone.utc)
-
-
-def get_inclusive_bar_range(start_idx: int, max_span: int, total_len: int) -> range:
-    end_bound = min(total_len, start_idx + max_span + 1)
-    return range(start_idx, end_bound)
-
-
-def drop_unclosed_tail(df: pd.DataFrame, cutoff_utc: datetime) -> pd.DataFrame:
-    if df.empty:
-        return df
-    return df[df.index <= cutoff_utc].copy()
-
-
-def normalize_to_close_time(index: pd.DatetimeIndex, interval_minutes: int) -> pd.DatetimeIndex:
-    if interval_minutes > 0 and BT_CFG.SOURCE_INTRADAY_TIMESTAMP_IS_BAR_START:
-        return index + timedelta(minutes=interval_minutes)
-    return index
-
-
-def get_ny_session_date(dt_ny: datetime) -> datetime.date:
-    if dt_ny.hour > 17 or (dt_ny.hour == 17 and dt_ny.minute > 0):
-        return dt_ny.date() + timedelta(days=1)
-    return dt_ny.date()
-
-
-def validate_and_clean_market_data(
-    df: pd.DataFrame,
-    name: str,
-    interval_minutes: int,
-    cutoff_utc: datetime,
-    is_intraday: bool = True,
-) -> pd.DataFrame:
-    if df.empty:
-        raise ValueError(f"CRITICAL: {name} DataFrame is empty.")
-
-    clean_df = df.copy()
-    clean_df.rename(columns={c: c.capitalize() for c in clean_df.columns}, inplace=True)
-    required_cols = ["Open", "High", "Low", "Close"]
-    for rc in required_cols:
-        if rc not in clean_df.columns:
-            raise ValueError(f"CRITICAL: {name} missing column {rc}")
-
-    clean_df.dropna(subset=required_cols, inplace=True)
-
-    if clean_df.index.tz is None:
-        clean_df.index = clean_df.index.tz_localize(timezone.utc)
-    else:
-        clean_df.index = clean_df.index.tz_convert(timezone.utc)
-
-    if is_intraday:
-        clean_df.index = normalize_to_close_time(clean_df.index, interval_minutes)
-
-    clean_df = drop_unclosed_tail(clean_df, cutoff_utc)
-    clean_df = clean_df[~clean_df.index.duplicated(keep="first")].sort_index()
-    return clean_df
-
-
-# ==================================================================================================
-# 5. CAUSAL LIQUIDITY & SEQUENCE ENGINE
-# ==================================================================================================
-class CausalLiquidityEngine:
+# ==========================================================================================
+# SECTION 2 : TIME & VOLATILITY FILTER (24/7 TRADING MODE)
+# ==========================================================================================
+class KillzoneFilter:
     @staticmethod
-    def get_confirmed_fractals(
-        df_history: pd.DataFrame,
-        eval_time: datetime,
-        window: int = BT_CFG.FRACTAL_CONFIRM_BARS,
-    ) -> Tuple[List[CausalLevel], List[CausalLevel]]:
+    def _in_range(t: datetime, start: tuple, end: tuple) -> bool:
+        cur = t.hour * 60 + t.minute
+        s = start[0] * 60 + start[1]
+        e = end[0] * 60 + end[1]
+        return s <= cur <= e
+
+    @classmethod
+    def check(cls, t: datetime = None) -> dict:
+        t = t or now_th()
+        if t.weekday() not in CFG.TRADE_WEEKDAYS:
+            return {"active": False, "zone": "WEEKEND", "reason": "วันหยุดสุดสัปดาห์"}
+
+        return {
+            "active": True,
+            "zone": "24H_TRADING_MODE",
+            "reason": f"โหมดเทรด 24 ชม. (เวลาปัจจุบัน {t.strftime('%H:%M')} น.)"
+        }
+
+    @classmethod
+    def next_killzone_str(cls, t: datetime = None) -> str:
+        return "ตลาดเปิดตลอด 24 ชั่วโมง (24/7 Mode)"
+
+
+# ==========================================================================================
+# SECTION 3 : INSTITUTIONAL SMC LOGIC & PRICING ARRAY
+# ==========================================================================================
+class SMCEngine:
+    @staticmethod
+    def swing_points(df: pd.DataFrame, lookback: int) -> dict:
+        seg = df.tail(lookback)
+        sw_high = safe_float(seg["High"].max())
+        sw_low = safe_float(seg["Low"].min())
+        idx_high = seg["High"].idxmax()
+        idx_low = seg["Low"].idxmin()
+        return {
+            "swing_high": sw_high,
+            "swing_low": sw_low,
+            "swing_high_time": idx_high,
+            "swing_low_time": idx_low,
+            "range": max(sw_high - sw_low, 1e-9),
+            "equilibrium": (sw_high + sw_low) / 2.0,
+        }
+
+    @staticmethod
+    def fractal_swings(df: pd.DataFrame, left: int = 2, right: int = 2, lookback: int = 40):
+        seg = df.tail(lookback).reset_index(drop=False)
         highs, lows = [], []
-        n = len(df_history)
-        if n < (window * 2 + 1):
-            return highs, lows
-
-        for i in range(window, n - window):
-            h_curr = float(df_history["High"].iloc[i])
-            l_curr = float(df_history["Low"].iloc[i])
-            formation_time = df_history.index[i]
-            confirmed_time = df_history.index[i + window]
-
-            if confirmed_time > eval_time:
-                continue
-
-            is_high, is_low = True, True
-            for k in range(1, window + 1):
-                if df_history["High"].iloc[i - k] >= h_curr or df_history["High"].iloc[i + k] >= h_curr:
-                    is_high = False
-                if df_history["Low"].iloc[i - k] <= l_curr or df_history["Low"].iloc[i + k] <= l_curr:
-                    is_low = False
-
+        for i in range(left, len(seg) - right):
+            h = seg["High"].iloc[i]
+            l = seg["Low"].iloc[i]
+            is_high = all(h > seg["High"].iloc[i - k] for k in range(1, left + 1)) and \
+                      all(h > seg["High"].iloc[i + k] for k in range(1, right + 1))
+            is_low = all(l < seg["Low"].iloc[i - k] for k in range(1, left + 1)) and \
+                     all(l < seg["Low"].iloc[i + k] for k in range(1, right + 1))
             if is_high:
-                highs.append(CausalLevel("SWING_HIGH", h_curr, formation_time, confirmed_time))
+                highs.append({"price": safe_float(h), "idx": i})
             if is_low:
-                lows.append(CausalLevel("SWING_LOW", l_curr, formation_time, confirmed_time))
+                lows.append({"price": safe_float(l), "idx": i})
+        return list(reversed(highs)), list(reversed(lows))
 
-        return highs, lows
-
-    @staticmethod
-    def get_causal_equal_levels(
-        df_history: pd.DataFrame,
-        eval_time: datetime,
-        tolerance: float = BT_CFG.EQUAL_LEVEL_TOLERANCE,
-    ) -> Tuple[List[CausalLevel], List[CausalLevel]]:
-        h_vals = df_history["High"].values
-        l_vals = df_history["Low"].values
-        n = len(h_vals)
-        eqh, eql = [], []
-        if n < 10:
-            return eqh, eql
-
-        for i in range(max(0, n - 50), n - 4):
-            t1 = df_history.index[i]
-            for j in range(i + 3, min(i + 20, n)):
-                t2 = df_history.index[j]
-                if t2 > eval_time:
-                    continue
-
-                if abs(h_vals[i] - h_vals[j]) / h_vals[i] <= tolerance:
-                    avg_p = round(float(h_vals[i] + h_vals[j]) / 2.0, 2)
-                    eqh.append(CausalLevel("EQH", avg_p, t1, t2))
-
-                if abs(l_vals[i] - l_vals[j]) / l_vals[i] <= tolerance:
-                    avg_p = round(float(l_vals[i] + l_vals[j]) / 2.0, 2)
-                    eql.append(CausalLevel("EQL", avg_p, t1, t2))
-
-        return eqh, eql
-
-    @staticmethod
-    def extract_closed_session_and_daily_levels(
-        df_ltf_history: pd.DataFrame,
-        current_time: datetime,
-    ) -> List[CausalLevel]:
-        levels: List[CausalLevel] = []
-        if df_ltf_history.empty or len(df_ltf_history) < 45:
-            return levels
-
-        ny_tz = pytz.timezone(BT_CFG.TRADING_DATE_TZ)
-        sub_ny = df_ltf_history.copy()
-        sub_ny["ny_time"] = sub_ny.index.tz_convert(ny_tz)
-        sub_ny["session_date"] = sub_ny["ny_time"].apply(get_ny_session_date)
-
-        cur_ny_time = current_time.astimezone(ny_tz)
-        cur_session_date = get_ny_session_date(cur_ny_time)
-
-        completed_sessions = sub_ny[sub_ny["session_date"] < cur_session_date]
-        if not completed_sessions.empty:
-            last_sess_date = completed_sessions["session_date"].max()
-            last_sess_bars = completed_sessions[completed_sessions["session_date"] == last_sess_date].sort_index()
-            if not last_sess_bars.empty:
-                pdh = round(float(last_sess_bars["High"].max()), 2)
-                pdl = round(float(last_sess_bars["Low"].min()), 2)
-                conf_time = last_sess_bars.index[-1]
-                if conf_time <= current_time:
-                    levels.append(CausalLevel("PDH", pdh, last_sess_bars.index[0], conf_time))
-                    levels.append(CausalLevel("PDL", pdl, last_sess_bars.index[0], conf_time))
-
-        return levels
-
-    @staticmethod
-    def get_last_closed_htf_bar(df_htf: pd.DataFrame, signal_time: datetime) -> Optional[pd.Series]:
-        past_htf = df_htf[df_htf.index <= signal_time]
-        if past_htf.empty:
-            return None
-        return past_htf.iloc[-1]
-
-
-class CausalSequenceEngine:
     @classmethod
-    def evaluate(
-        cls,
-        df_closed: pd.DataFrame,
-        h1_bias: str,
-        levels: List[CausalLevel],
-        fractal_highs: List[CausalLevel],
-        fractal_lows: List[CausalLevel],
-        eqh: List[CausalLevel],
-        eql: List[CausalLevel],
-        params: Dict[str, float],
-    ) -> Tuple[bool, str, Dict[str, Any]]:
-        n = len(df_closed)
-        if n < 45:
-            return False, "INSUFFICIENT_HISTORY", {}
-
-        cur_bar = df_closed.iloc[-1]
-        t_now_idx = n - 1
-        cur_atr = float(cur_bar["ATR"])
-        if cur_atr <= 0:
-            return False, "INVALID_ATR", {}
-
-        sl_atr_buf = params["sl_atr_buffer"]
-        min_disp_ratio = params["min_displacement_ratio"]
-        min_wick_ratio = params["min_rejection_wick_ratio"]
-
-        if h1_bias == "BULLISH":
-            candidate_lows: List[CausalLevel] = [lv for lv in levels if lv.level_type == "PDL"]
-            candidate_lows += eql
-            candidate_lows += fractal_lows
-
-            sweep: Optional[SweepEvent] = None
-            for s_idx in range(t_now_idx - 5, max(0, t_now_idx - 18), -1):
-                bar_s = df_closed.iloc[s_idx]
-                bar_s_time = df_closed.index[s_idx]
-                for target_level in candidate_lows:
-                    if target_level.confirmed_time < bar_s_time and bar_s["Low"] < target_level.price and bar_s["Close"] > target_level.price:
-                        sweep = SweepEvent(
-                            timestamp=bar_s_time,
-                            bar_index=s_idx,
-                            direction="BULLISH_SWEEP",
-                            level_price=target_level.price,
-                            level_type=target_level.level_type,
-                            extreme_price=float(bar_s["Low"]),
-                        )
-                        break
-                if sweep is not None:
-                    break
-
-            if sweep is None:
-                return False, "NO_SWEEP", {}
-
-            prior_highs = [fh for fh in fractal_highs if fh.confirmed_time < sweep.timestamp]
-            if not prior_highs:
-                return False, "NO_STRUCTURAL_HIGH_PRIOR_SWEEP", {}
-
-            struct_high = prior_highs[-1].price
-            mss: Optional[MSSEvent] = None
-            for m_idx in get_inclusive_bar_range(sweep.bar_index + 1, BT_CFG.MAX_SWEEP_TO_MSS_BARS, n):
-                if df_closed["Close"].iloc[m_idx] > struct_high:
-                    mss = MSSEvent(
-                        timestamp=df_closed.index[m_idx],
-                        bar_index=m_idx,
-                        struct_level=struct_high,
-                        break_price=float(df_closed["Close"].iloc[m_idx]),
-                    )
-                    break
-
-            if mss is None:
-                return False, "MSS_TIMEOUT", {}
-
-            displacement: Optional[DisplacementEvent] = None
-            for d_idx in get_inclusive_bar_range(mss.bar_index + 1, BT_CFG.MAX_MSS_TO_DISP_BARS, n):
-                b = df_closed.iloc[d_idx]
-                disp_atr = float(df_closed["ATR"].iloc[d_idx])
-                b_rng = max(float(b["High"] - b["Low"]), 1e-5)
-                b_body = abs(float(b["Close"] - b["Open"]))
-                b_ratio = b_body / b_rng
-                rng_atr_ratio = b_rng / max(disp_atr, 1e-5)
-
-                if (b_ratio >= min_disp_ratio) and (rng_atr_ratio >= 0.85):
-                    displacement = DisplacementEvent(
-                        timestamp=df_closed.index[d_idx],
-                        bar_index=d_idx,
-                        body_ratio=b_ratio,
-                        range_atr_ratio=rng_atr_ratio,
-                    )
-                    break
-
-            if displacement is None:
-                return False, "NO_DISPLACEMENT", {}
-
-            fvg: Optional[FVGStructure] = None
-            start_fvg_center = displacement.bar_index + 2
-            for f_idx in get_inclusive_bar_range(start_fvg_center, BT_CFG.MAX_DISP_TO_FVG_BARS, n - 1):
-                c1 = df_closed.iloc[f_idx - 1]
-                c3 = df_closed.iloc[f_idx + 1]
-                fvg_atr = float(df_closed["ATR"].iloc[f_idx + 1])
-                if c1["High"] < c3["Low"]:
-                    gap_bot = float(c1["High"])
-                    gap_top = float(c3["Low"])
-                    gap_size = gap_top - gap_bot
-                    if gap_size >= (0.20 * fvg_atr):
-                        fvg = FVGStructure(
-                            created_time=df_closed.index[f_idx],
-                            confirmed_time=df_closed.index[f_idx + 1],
-                            bar_index=f_idx + 1,
-                            direction="BULLISH",
-                            top=gap_top,
-                            bottom=gap_bot,
-                            size=gap_size,
-                        )
-                        break
-
-            if fvg is None:
-                return False, "NO_FVG", {}
-
-            if (t_now_idx - fvg.bar_index) > BT_CFG.MAX_FVG_TO_RETEST_BARS:
-                return False, "FVG_STALE_TIMEOUT", {}
-
-            penetrated = (cur_bar["Low"] <= fvg.top) and (cur_bar["Low"] >= (fvg.bottom - 0.25 * cur_atr))
-            closed_above = cur_bar["Close"] >= fvg.bottom
-            lower_wick = min(float(cur_bar["Open"]), float(cur_bar["Close"])) - float(cur_bar["Low"])
-            bar_span = max(float(cur_bar["High"] - cur_bar["Low"]), 1e-5)
-            rejection_wick = (lower_wick / bar_span) >= min_wick_ratio
-
-            if not (penetrated and closed_above and rejection_wick):
-                return False, "FVG_RETEST_INCOMPLETE_OR_WEAK_REJECTION", {}
-
-            sl_price = sweep.extreme_price - (sl_atr_buf * cur_atr)
-            setup_id = f"BUY|{sweep.timestamp.isoformat()}|{fvg.confirmed_time.isoformat()}"
-
-            return True, "VALID_BULLISH_SEQUENCE", {
-                "direction": "BUY",
-                "setup_id": setup_id,
-                "sl_price": round(sl_price, 2),
-            }
-
+    def premium_discount(cls, htf: pd.DataFrame, price: float) -> dict:
+        sw = cls.swing_points(htf, CFG.HTF_SWING_LOOKBACK)
+        pos = (price - sw["swing_low"]) / sw["range"]
+        if pos > 0.5 + CFG.EQ_BUFFER:
+            zone = "PREMIUM"
+        elif pos < 0.5 - CFG.EQ_BUFFER:
+            zone = "DISCOUNT"
         else:
-            candidate_highs: List[CausalLevel] = [lv for lv in levels if lv.level_type == "PDH"]
-            candidate_highs += eqh
-            candidate_highs += fractal_highs
+            zone = "EQUILIBRIUM"
+        return {
+            **sw,
+            "position_pct": round(pos * 100, 2),
+            "zone": zone,
+            "allow_buy": zone == "DISCOUNT",
+            "allow_sell": zone == "PREMIUM",
+        }
 
-            sweep = None
-            for s_idx in range(t_now_idx - 5, max(0, t_now_idx - 18), -1):
-                bar_s = df_closed.iloc[s_idx]
-                bar_s_time = df_closed.index[s_idx]
-                for target_level in candidate_highs:
-                    if target_level.confirmed_time < bar_s_time and bar_s["High"] > target_level.price and bar_s["Close"] < target_level.price:
-                        sweep = SweepEvent(
-                            timestamp=bar_s_time,
-                            bar_index=s_idx,
-                            direction="BEARISH_SWEEP",
-                            level_price=target_level.price,
-                            level_type=target_level.level_type,
-                            extreme_price=float(bar_s["High"]),
-                        )
-                        break
-                if sweep is not None:
-                    break
-
-            if sweep is None:
-                return False, "NO_SWEEP", {}
-
-            prior_lows = [fl for fl in fractal_lows if fl.confirmed_time < sweep.timestamp]
-            if not prior_lows:
-                return False, "NO_STRUCTURAL_LOW_PRIOR_SWEEP", {}
-
-            struct_low = prior_lows[-1].price
-            mss = None
-            for m_idx in get_inclusive_bar_range(sweep.bar_index + 1, BT_CFG.MAX_SWEEP_TO_MSS_BARS, n):
-                if df_closed["Close"].iloc[m_idx] < struct_low:
-                    mss = MSSEvent(
-                        timestamp=df_closed.index[m_idx],
-                        bar_index=m_idx,
-                        struct_level=struct_low,
-                        break_price=float(df_closed["Close"].iloc[m_idx]),
-                    )
-                    break
-
-            if mss is None:
-                return False, "MSS_TIMEOUT", {}
-
-            displacement = None
-            for d_idx in get_inclusive_bar_range(mss.bar_index + 1, BT_CFG.MAX_MSS_TO_DISP_BARS, n):
-                b = df_closed.iloc[d_idx]
-                disp_atr = float(df_closed["ATR"].iloc[d_idx])
-                b_rng = max(float(b["High"] - b["Low"]), 1e-5)
-                b_body = abs(float(b["Close"] - b["Open"]))
-                b_ratio = b_body / b_rng
-                rng_atr_ratio = b_rng / max(disp_atr, 1e-5)
-
-                if (b_ratio >= min_disp_ratio) and (rng_atr_ratio >= 0.85):
-                    displacement = DisplacementEvent(
-                        timestamp=df_closed.index[d_idx],
-                        bar_index=d_idx,
-                        body_ratio=b_ratio,
-                        range_atr_ratio=rng_atr_ratio,
-                    )
-                    break
-
-            if displacement is None:
-                return False, "NO_DISPLACEMENT", {}
-
-            fvg = None
-            start_fvg_center = displacement.bar_index + 2
-            for f_idx in get_inclusive_bar_range(start_fvg_center, BT_CFG.MAX_DISP_TO_FVG_BARS, n - 1):
-                c1 = df_closed.iloc[f_idx - 1]
-                c3 = df_closed.iloc[f_idx + 1]
-                fvg_atr = float(df_closed["ATR"].iloc[f_idx + 1])
-                if c1["Low"] > c3["High"]:
-                    gap_top = float(c1["Low"])
-                    gap_bot = float(c3["High"])
-                    gap_size = gap_top - gap_bot
-                    if gap_size >= (0.20 * fvg_atr):
-                        fvg = FVGStructure(
-                            created_time=df_closed.index[f_idx],
-                            confirmed_time=df_closed.index[f_idx + 1],
-                            bar_index=f_idx + 1,
-                            direction="BEARISH",
-                            top=gap_top,
-                            bottom=gap_bot,
-                            size=gap_size,
-                        )
-                        break
-
-            if fvg is None:
-                return False, "NO_FVG", {}
-
-            if (t_now_idx - fvg.bar_index) > BT_CFG.MAX_FVG_TO_RETEST_BARS:
-                return False, "FVG_STALE_TIMEOUT", {}
-
-            penetrated = (cur_bar["High"] >= fvg.bottom) and (cur_bar["High"] <= (fvg.top + 0.25 * cur_atr))
-            closed_below = cur_bar["Close"] <= fvg.top
-            upper_wick = float(cur_bar["High"]) - max(float(cur_bar["Open"]), float(cur_bar["Close"]))
-            bar_span = max(float(cur_bar["High"] - cur_bar["Low"]), 1e-5)
-            rejection_wick = (upper_wick / bar_span) >= min_wick_ratio
-
-            if not (penetrated and closed_below and rejection_wick):
-                return False, "FVG_RETEST_INCOMPLETE_OR_WEAK_REJECTION", {}
-
-            sl_price = sweep.extreme_price + (sl_atr_buf * cur_atr)
-            setup_id = f"SELL|{sweep.timestamp.isoformat()}|{fvg.confirmed_time.isoformat()}"
-
-            return True, "VALID_BEARISH_SEQUENCE", {
-                "direction": "SELL",
-                "setup_id": setup_id,
-                "sl_price": round(sl_price, 2),
-            }
-
-
-class DynamicLiquidityTargetEngine:
     @classmethod
-    def resolve_target(
-        cls,
-        direction: str,
-        entry_time: datetime,
-        entry_price: float,
-        sl_price: float,
-        levels: List[CausalLevel],
-        fractal_highs: List[CausalLevel],
-        fractal_lows: List[CausalLevel],
-        eqh: List[CausalLevel],
-        eql: List[CausalLevel],
-    ) -> Tuple[bool, str, float, float, float, str]:
-        risk_dist = abs(entry_price - sl_price)
-        if risk_dist <= 0:
-            return False, "INVALID_RISK_DISTANCE", 0.0, 0.0, 0.0, ""
+    def liquidity_sweep(cls, ltf: pd.DataFrame) -> dict:
+        result = {"bullish_sweep": False, "bearish_sweep": False,
+                  "swept_level": None, "sweep_bars_ago": None, "detail": "ไม่พบการกวาด Liquidity"}
+        if len(ltf) < CFG.LTF_SWING_LOOKBACK + CFG.SWEEP_WINDOW + 5:
+            return result
 
-        min_reward_dist = risk_dist * BT_CFG.MIN_RR
+        hist = ltf.iloc[:-CFG.SWEEP_WINDOW]
+        recent = ltf.tail(CFG.SWEEP_WINDOW)
+
+        highs, lows = cls.fractal_swings(hist, left=2, right=2, lookback=CFG.LTF_SWING_LOOKBACK)
+        ref_high = highs[0]["price"] if highs else safe_float(hist["High"].tail(CFG.LTF_SWING_LOOKBACK).max())
+        ref_low = lows[0]["price"] if lows else safe_float(hist["Low"].tail(CFG.LTF_SWING_LOOKBACK).min())
+
+        for i in range(len(recent)):
+            row = recent.iloc[i]
+            bars_ago = len(recent) - i - 1
+            if row["Low"] < ref_low and row["Close"] > ref_low:
+                result.update({
+                    "bullish_sweep": True, "swept_level": round(ref_low, 2),
+                    "sweep_bars_ago": bars_ago,
+                    "detail": f"กวาด Sell-side Liquidity ใต้ {ref_low:.2f} แล้วปิดกลับเหนือระดับ ({bars_ago} แท่งก่อน)"
+                })
+            if row["High"] > ref_high and row["Close"] < ref_high:
+                result.update({
+                    "bearish_sweep": True, "swept_level": round(ref_high, 2),
+                    "sweep_bars_ago": bars_ago,
+                    "detail": f"กวาด Buy-side Liquidity เหนือ {ref_high:.2f} แล้วปิดกลับใต้ระดับ ({bars_ago} แท่งก่อน)"
+                })
+
+        result["ref_high"] = round(ref_high, 2)
+        result["ref_low"] = round(ref_low, 2)
+        return result
+
+    @classmethod
+    def detect_fvg(cls, ltf: pd.DataFrame, atr_val: float) -> dict:
+        out = {"has_fvg": False, "type": None, "top": None, "bottom": None,
+               "size": 0.0, "tested": False, "bars_ago": None, "detail": "ไม่พบ FVG ที่มีนัยยะ"}
+        if len(ltf) < CFG.FVG_SCAN_BARS + 3:
+            return out
+
+        seg = ltf.tail(CFG.FVG_SCAN_BARS).reset_index(drop=True)
+        price = safe_float(ltf["Close"].iloc[-1])
+        min_size = max(atr_val * CFG.FVG_MIN_SIZE_ATR, 0.30)
+        found = []
+
+        for i in range(len(seg) - 3, -1, -1):
+            c1, c2, c3 = seg.iloc[i], seg.iloc[i + 1], seg.iloc[i + 2]
+            bars_ago = len(seg) - (i + 3)
+
+            # Bullish FVG
+            if c1["High"] < c3["Low"]:
+                bottom, top = safe_float(c1["High"]), safe_float(c3["Low"])
+                size = top - bottom
+                if size >= min_size:
+                    after = seg.iloc[i + 3:]
+                    invalidated = (not after.empty) and (after["Low"].min() < bottom)
+                    tested = bottom <= price <= top or (
+                        (not after.empty) and after["Low"].min() <= top
+                    )
+                    if not invalidated:
+                        found.append({"type": "BULLISH", "top": top, "bottom": bottom,
+                                      "size": size, "tested": bool(tested), "bars_ago": bars_ago})
+
+            # Bearish FVG
+            if c1["Low"] > c3["High"]:
+                top, bottom = safe_float(c1["Low"]), safe_float(c3["High"])
+                size = top - bottom
+                if size >= min_size:
+                    after = seg.iloc[i + 3:]
+                    invalidated = (not after.empty) and (after["High"].max() > top)
+                    tested = bottom <= price <= top or (
+                        (not after.empty) and after["High"].max() >= bottom
+                    )
+                    if not invalidated:
+                        found.append({"type": "BEARISH", "top": top, "bottom": bottom,
+                                      "size": size, "tested": bool(tested), "bars_ago": bars_ago})
+
+            if found:
+                break
+
+        if found:
+            f = found[0]
+            out.update({
+                "has_fvg": True, "type": f["type"],
+                "top": round(f["top"], 2), "bottom": round(f["bottom"], 2),
+                "size": round(f["size"], 2), "tested": f["tested"], "bars_ago": f["bars_ago"],
+                "detail": f"{f['type']} FVG ช่วง {f['bottom']:.2f}-{f['top']:.2f} "
+                          f"({f['size']:.2f} USD) {'[ทดสอบแล้ว]' if f['tested'] else '[ยังไม่ทดสอบ]'}"
+            })
+        return out
+
+    @classmethod
+    def evaluate(cls, htf: pd.DataFrame, ltf: pd.DataFrame) -> dict:
+        price = safe_float(ltf["Close"].iloc[-1])
+
+        htf = htf.copy()
+        htf["EMA200"] = Indicators.ema(htf["Close"], CFG.EMA_PERIOD)
+        htf["ATR"] = Indicators.atr(htf, CFG.ATR_PERIOD)
+        ema200_h1 = safe_float(htf["EMA200"].iloc[-1], price)
+        htf_close = safe_float(htf["Close"].iloc[-1], price)
+        htf_bias = "BULLISH" if htf_close > ema200_h1 else "BEARISH"
+        htf_atr = safe_float(htf["ATR"].iloc[-1], 1.0)
+
+        ltf = ltf.copy()
+        ltf["RSI"] = Indicators.rsi(ltf["Close"], CFG.RSI_PERIOD)
+        ltf["ATR"] = Indicators.atr(ltf, CFG.ATR_PERIOD)
+        rsi = safe_float(ltf["RSI"].iloc[-1], 50.0)
+        atr = safe_float(ltf["ATR"].iloc[-1], 1.0)
+
+        pd_arr = cls.premium_discount(htf, price)
+        sweep = cls.liquidity_sweep(ltf)
+        fvg = cls.detect_fvg(ltf, atr)
+
+        ctx = {
+            "price": round(price, 2),
+            "htf_bias": htf_bias,
+            "htf_ema200": round(ema200_h1, 2),
+            "htf_close": round(htf_close, 2),
+            "htf_atr": round(htf_atr, 2),
+            "ltf_rsi": round(rsi, 2),
+            "ltf_atr": round(atr, 2),
+            "pd_array": pd_arr,
+            "sweep": sweep,
+            "fvg": fvg,
+            "checks": {},
+            "direction": "NONE",
+            "reject_reasons": [],
+        }
+
+        buy_checks = {
+            "discount_zone": pd_arr["allow_buy"],
+            "liquidity_swept_low": sweep["bullish_sweep"],
+            "bullish_fvg_tested": fvg["has_fvg"] and fvg["type"] == "BULLISH" and fvg["tested"],
+            "htf_bias_ok": htf_bias == "BULLISH",
+            "rsi_ok": CFG.RSI_BUY_RANGE[0] <= rsi <= CFG.RSI_BUY_RANGE[1],
+        }
+
+        sell_checks = {
+            "premium_zone": pd_arr["allow_sell"],
+            "liquidity_swept_high": sweep["bearish_sweep"],
+            "bearish_fvg_tested": fvg["has_fvg"] and fvg["type"] == "BEARISH" and fvg["tested"],
+            "htf_bias_ok": htf_bias == "BEARISH",
+            "rsi_ok": CFG.RSI_SELL_RANGE[0] <= rsi <= CFG.RSI_SELL_RANGE[1],
+        }
+
+        buy_score = sum(1 for v in buy_checks.values() if v)
+        sell_score = sum(1 for v in sell_checks.values() if v)
+
+        if all(buy_checks.values()):
+            ctx["direction"] = "BUY"
+            ctx["checks"] = buy_checks
+        elif all(sell_checks.values()):
+            ctx["direction"] = "SELL"
+            ctx["checks"] = sell_checks
+        else:
+            ctx["checks"] = {"buy": buy_checks, "sell": sell_checks}
+            side = "BUY" if buy_score >= sell_score else "SELL"
+            failed = [k for k, v in (buy_checks if side == "BUY" else sell_checks).items() if not v]
+            ctx["reject_reasons"] = failed
+            ctx["best_side"] = side
+            ctx["best_score"] = f"{max(buy_score, sell_score)}/5"
+
+        return ctx
+
+
+# ==========================================================================================
+# SECTION 4 : NEWS BLACKOUT ENGINE
+# ==========================================================================================
+class NewsBlackoutEngine:
+    def __init__(self):
+        self.events = []
+        self.last_fetch = 0.0
+        self.lock = threading.Lock()
+
+    def fetch(self, force: bool = False) -> None:
+        if not force and (time.time() - self.last_fetch) < CFG.NEWS_REFRESH_SEC and self.events:
+            return
+        try:
+            r = requests.get(
+                CFG.FF_CALENDAR_URL, timeout=25,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; SMC-GoldBot/1.0)"}
+            )
+            r.raise_for_status()
+            raw = r.json()
+            parsed = []
+            for ev in raw:
+                country = str(ev.get("country", "")).upper()
+                impact = str(ev.get("impact", "")).lower()
+                if country != "USD" or impact != "high":
+                    continue
+                dt_str = ev.get("date")
+                if not dt_str:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                parsed.append({
+                    "title": ev.get("title", "Unknown"),
+                    "time": dt.astimezone(CFG.TZ),
+                    "forecast": ev.get("forecast", ""),
+                    "previous": ev.get("previous", ""),
+                })
+            parsed.sort(key=lambda x: x["time"])
+            with self.lock:
+                self.events = parsed
+                self.last_fetch = time.time()
+            log.info(f"[News] โหลดข่าว USD High Impact สำเร็จ {len(parsed)} รายการ")
+        except Exception as e:
+            log.warning(f"[News] ดึงปฏิทินข่าวไม่สำเร็จ: {e}")
+
+    def check_blackout(self, t: datetime = None) -> dict:
+        t = t or now_th()
+        self.fetch()
+        with self.lock:
+            evs = list(self.events)
+
+        for ev in evs:
+            start = ev["time"] - timedelta(minutes=CFG.NEWS_BLACKOUT_BEFORE_MIN)
+            end = ev["time"] + timedelta(minutes=CFG.NEWS_BLACKOUT_AFTER_MIN)
+            if start <= t <= end:
+                return {
+                    "blackout": True,
+                    "event": ev["title"],
+                    "event_time": ev["time"],
+                    "reason": f"อยู่ในช่วง News Blackout: {ev['title']} "
+                              f"เวลา {ev['time'].strftime('%d/%m %H:%M')} น. (±{CFG.NEWS_BLACKOUT_BEFORE_MIN} นาที)"
+                }
+        return {"blackout": False, "event": None, "event_time": None, "reason": "ไม่มีข่าวแรงในช่วงนี้"}
+
+    def next_event(self, t: datetime = None) -> dict:
+        t = t or now_th()
+        self.fetch()
+        with self.lock:
+            for ev in self.events:
+                if ev["time"] > t:
+                    mins = int((ev["time"] - t).total_seconds() // 60)
+                    return {"title": ev["title"], "time": ev["time"], "minutes_away": mins}
+        return {"title": None, "time": None, "minutes_away": None}
+
+
+# ==========================================================================================
+# SECTION 5 : ADVANCED AI BRAIN (GEMINI REST + CLAUDE + FALLBACK)
+# ==========================================================================================
+class AIBrain:
+    SYSTEM_PROMPT = """You are an institutional Smart Money Concepts (SMC) quantitative trader and risk officer for Spot Gold (XAUUSD).
+Validate the technical setup strictly and return ONLY a valid JSON object (no markdown fences, no other text):
+{
+  "decision": "BUY" | "SELL" | "WAIT",
+  "confidence": <integer 0-100>,
+  "entry": <float>,
+  "stop_loss": <float>,
+  "take_profit": <float>,
+  "risk_reward": <float>,
+  "liquidity_narrative": "<1-2 sentences in Thai or English explaining the liquidity sweep>",
+  "structure_reason": "<1-2 sentences explaining structural SL placement>",
+  "reasoning_th": "<สรุปเหตุผลกระชับเป็นภาษาไทย 2 ประโยค>",
+  "invalidation": "<เงื่อนไขยกเลิกไอเดีย>"
+}"""
+
+    def __init__(self):
+        self.provider = CFG.AI_PROVIDER
+        self.enabled = (
+            (self.provider == "gemini" and bool(CFG.GEMINI_API_KEY)) or
+            (self.provider == "claude" and bool(CFG.CLAUDE_API_KEY))
+        )
+        if not self.enabled:
+            log.warning("[AI] ไม่พบ API Key สำหรับ AI — ระบบจะใช้ Fallback Quant Engine อัตโนมัติ")
+
+    @staticmethod
+    def build_payload(ctx: dict, kz: dict, news_next: dict) -> dict:
+        return {
+            "symbol": "XAUUSD (Spot Gold via PAXG-USD)",
+            "timestamp_bangkok": fmt_th(now_th()),
+            "current_price": ctx["price"],
+            "proposed_direction": ctx["direction"],
+            "higher_timeframe_H1": {
+                "bias": ctx["htf_bias"],
+                "ema200": ctx["htf_ema200"],
+                "close": ctx["htf_close"],
+                "atr": ctx["htf_atr"],
+                "swing_high_20": round(ctx["pd_array"]["swing_high"], 2),
+                "swing_low_20": round(ctx["pd_array"]["swing_low"], 2),
+                "equilibrium_50pct": round(ctx["pd_array"]["equilibrium"], 2),
+            },
+            "premium_discount_array": {
+                "zone": ctx["pd_array"]["zone"],
+                "position_in_range_pct": ctx["pd_array"]["position_pct"],
+            },
+            "liquidity_sweep": ctx["sweep"],
+            "fair_value_gap_M15": ctx["fvg"],
+            "momentum": {
+                "rsi14_M15": ctx["ltf_rsi"],
+                "atr14_M15": ctx["ltf_atr"],
+            },
+            "session": kz,
+            "nearest_high_impact_news": news_next,
+            "constraints": {"minimum_risk_reward": CFG.MIN_RR},
+        }
+
+    def _call_gemini(self, payload: dict) -> str:
+        models = [CFG.GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash"]
+        last_e = None
+        for m in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={CFG.GEMINI_API_KEY}"
+            body = {
+                "system_instruction": {"parts": [{"text": self.SYSTEM_PROMPT}]},
+                "contents": [{
+                    "role": "user",
+                    "parts": [{"text": "Analyse setup and return JSON:\n" + json.dumps(payload, ensure_ascii=False)}]
+                }],
+                "generationConfig": {
+                    "temperature": 0.15,
+                    "maxOutputTokens": 1000,
+                    "responseMimeType": "application/json",
+                },
+            }
+            try:
+                r = requests.post(url, json=body, timeout=CFG.AI_TIMEOUT)
+                r.raise_for_status()
+                data = r.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except Exception as e:
+                last_e = e
+                continue
+        raise RuntimeError(f"Gemini API ล้มเหลวทุกโมเดล: {last_e}")
+
+    def _call_claude(self, payload: dict) -> str:
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": CFG.CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        body = {
+            "model": CFG.CLAUDE_MODEL,
+            "max_tokens": 1000,
+            "temperature": 0.15,
+            "system": self.SYSTEM_PROMPT,
+            "messages": [{
+                "role": "user",
+                "content": "Analyse setup and return JSON:\n" + json.dumps(payload, ensure_ascii=False)
+            }],
+        }
+        r = requests.post(url, headers=headers, json=body, timeout=CFG.AI_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        return "".join(blk.get("text", "") for blk in data.get("content", []))
+
+    @staticmethod
+    def _extract_json(text: str) -> dict:
+        t = text.strip()
+        if "```" in t:
+            parts = t.split("```")
+            for p in parts:
+                p = p.strip()
+                if p.startswith("json"):
+                    p = p[4:].strip()
+                if p.startswith("{"):
+                    t = p
+                    break
+        s, e = t.find("{"), t.rfind("}")
+        if s == -1 or e == -1:
+            raise ValueError("ไม่พบ JSON ในคำตอบ")
+        return json.loads(t[s:e + 1])
+
+    def validate(self, ctx: dict, kz: dict, news_next: dict) -> dict:
+        payload = self.build_payload(ctx, kz, news_next)
+        if not self.enabled:
+            return FallbackEngine.decide(ctx, reason="ไม่ได้เปิดใช้งาน AI API")
+
+        try:
+            raw = self._call_gemini(payload) if self.provider == "gemini" else self._call_claude(payload)
+            res = self._extract_json(raw)
+
+            decision = str(res.get("decision", "WAIT")).upper()
+            if decision not in ("BUY", "SELL"):
+                return {"decision": "WAIT", "source": f"AI({self.provider})",
+                        "reasoning_th": res.get("reasoning_th", "AI ประเมินว่ากราฟยังไม่ชัดเจน"),
+                        "liquidity_narrative": res.get("liquidity_narrative", ""),
+                        "confidence": int(safe_float(res.get("confidence", 0)))}
+
+            entry = safe_float(res.get("entry"), ctx["price"])
+            sl = safe_float(res.get("stop_loss"))
+            tp = safe_float(res.get("take_profit"))
+
+            valid = True
+            if decision == "BUY" and not (sl < entry < tp):
+                valid = False
+            if decision == "SELL" and not (tp < entry < sl):
+                valid = False
+
+            if not valid or sl <= 0 or tp <= 0:
+                log.warning("[AI] ค่า SL/TP ผิดตรรกะ → สลับไปใช้ Fallback")
+                return FallbackEngine.decide(ctx, reason="AI ส่งค่า SL/TP ผิดตรรกะ")
+
+            risk = abs(entry - sl)
+            reward = abs(tp - entry)
+            rr = reward / risk if risk > 0 else 0.0
+
+            if rr < CFG.MIN_RR:
+                return {"decision": "WAIT", "source": f"AI({self.provider})",
+                        "reasoning_th": f"R:R 1:{rr:.2f} ต่ำกว่าเกณฑ์ขั้นต่ำ 1:{CFG.MIN_RR}",
+                        "confidence": int(safe_float(res.get("confidence", 0)))}
+
+            return {
+                "decision": decision,
+                "source": f"AI({self.provider})",
+                "entry": round(entry, 2),
+                "stop_loss": round(sl, 2),
+                "take_profit": round(tp, 2),
+                "risk_reward": round(rr, 2),
+                "confidence": int(safe_float(res.get("confidence", 75))),
+                "liquidity_narrative": res.get("liquidity_narrative", ""),
+                "structure_reason": res.get("structure_reason", ""),
+                "reasoning_th": res.get("reasoning_th", ""),
+                "invalidation": res.get("invalidation", ""),
+            }
+        except Exception as e:
+            log.error(f"[AI] เรียก API ล้มเหลว: {e} → ใช้ Fallback Quant")
+            return FallbackEngine.decide(ctx, reason=f"AI ขัดข้อง ({type(e).__name__})")
+
+
+# ==========================================================================================
+# SECTION 5.1 : FALLBACK QUANT ENGINE
+# ==========================================================================================
+class FallbackEngine:
+    @staticmethod
+    def decide(ctx: dict, reason: str = "") -> dict:
+        direction = ctx.get("direction", "NONE")
+        if direction not in ("BUY", "SELL"):
+            return {"decision": "WAIT", "source": "FallbackQuant",
+                    "reasoning_th": "ไม่มีทิศทางที่ผ่านเกณฑ์ Confluence"}
+
+        entry = ctx["price"]
+        atr = max(ctx["ltf_atr"], 0.5)
+        buffer = CFG.SL_ATR_BUFFER * atr
 
         if direction == "BUY":
-            target_price = entry_price + min_reward_dist
-            return True, "VALID_LIQUIDITY_TARGET", round(target_price, 2), BT_CFG.MIN_RR, BT_CFG.MIN_RR, "ATR_FLEX_TARGET"
+            struct = ctx["sweep"].get("swept_level") or ctx["sweep"].get("ref_low") or (entry - 2 * atr)
+            fvg_bot = ctx["fvg"].get("bottom")
+            if fvg_bot:
+                struct = min(struct, fvg_bot)
+            sl = struct - buffer
+            risk = entry - sl
+            if risk <= 0:
+                sl = entry - (2.0 * atr)
+                risk = entry - sl
+            tp = entry + (risk * CFG.MIN_RR)
         else:
-            target_price = entry_price - min_reward_dist
-            return True, "VALID_LIQUIDITY_TARGET", round(target_price, 2), BT_CFG.MIN_RR, BT_CFG.MIN_RR, "ATR_FLEX_TARGET"
+            struct = ctx["sweep"].get("swept_level") or ctx["sweep"].get("ref_high") or (entry + 2 * atr)
+            fvg_top = ctx["fvg"].get("top")
+            if fvg_top:
+                struct = max(struct, fvg_top)
+            sl = struct + buffer
+            risk = sl - entry
+            if risk <= 0:
+                sl = entry + (2.0 * atr)
+                risk = sl - entry
+            tp = entry - (risk * CFG.MIN_RR)
+
+        rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
+
+        return {
+            "decision": direction,
+            "source": "FallbackQuant",
+            "entry": round(entry, 2),
+            "stop_loss": round(sl, 2),
+            "take_profit": round(tp, 2),
+            "risk_reward": round(rr, 2),
+            "confidence": 65,
+            "liquidity_narrative": ctx["sweep"]["detail"],
+            "structure_reason": f"SL วางนอกโครงสร้าง Swing ที่ {struct:.2f} เผื่อ {CFG.SL_ATR_BUFFER}×ATR",
+            "reasoning_th": f"[โหมดสำรอง] {reason} — คำนวณด้วย Quant SMC Rule (R:R 1:{rr:.2f})",
+            "invalidation": f"แท่ง M15 ปิด{'ต่ำกว่า' if direction=='BUY' else 'สูงกว่า'} {sl:.2f}",
+        }
 
 
-class CausalSizingEngine:
-    @staticmethod
-    def calculate_lot(
-        current_equity: float,
-        risk_pct: float,
-        executed_entry: float,
-        sl_price: float,
-    ) -> Tuple[bool, str, float, float, float]:
-        allowed_risk_usd = current_equity * (risk_pct / 100.0)
-        price_risk_dist = abs(executed_entry - sl_price)
-        worst_case_risk_per_standard_lot = (
-            (price_risk_dist + BT_CFG.ADVERSE_SLIPPAGE_USD) * BT_CFG.CONTRACT_SIZE
-        ) + BT_CFG.COMMISSION_ROUND_TRIP
+# ==========================================================================================
+# SECTION 6.1 : PERFORMANCE TRACKER
+# ==========================================================================================
+class PerformanceTracker:
+    DEFAULT = {
+        "wins": 0, "losses": 0, "total": 0, "win_rate": 0.0,
+        "total_points": 0.0, "total_pips": 0.0,
+        "best_trade_points": 0.0, "worst_trade_points": 0.0,
+        "buy_signals": 0, "sell_signals": 0,
+        "started_at": None, "last_updated": None, "history": [],
+    }
 
-        if worst_case_risk_per_standard_lot <= 0:
-            return False, "INVALID_RISK_PER_LOT", 0.0, 0.0, 0.0
+    def __init__(self, path: str = None):
+        self.path = path or CFG.STATS_FILE
+        self.data = self._load()
 
-        raw_lot = allowed_risk_usd / worst_case_risk_per_standard_lot
-        steps = math.floor(raw_lot / BT_CFG.LOT_STEP)
-        floored_lot = round(steps * BT_CFG.LOT_STEP, 4)
-        final_lot = max(min(floored_lot, BT_CFG.MAX_LOT), BT_CFG.MIN_LOT)
-        worst_case_modeled_risk_usd = round(final_lot * worst_case_risk_per_standard_lot, 2)
+    def _load(self) -> dict:
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                for k, v in self.DEFAULT.items():
+                    d.setdefault(k, v)
+                return d
+        except Exception as e:
+            log.warning(f"[Stats] อ่านไฟล์สถิติไม่สำเร็จ: {e}")
+        d = dict(self.DEFAULT)
+        d["started_at"] = fmt_th(now_th())
+        return d
 
-        return True, "LOT_APPROVED", final_lot, worst_case_modeled_risk_usd, worst_case_modeled_risk_usd
+    def save(self) -> None:
+        with FILE_LOCK:
+            try:
+                self.data["last_updated"] = fmt_th(now_th())
+                with open(self.path, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                log.error(f"[Stats] บันทึกไฟล์ไม่สำเร็จ: {e}")
+
+    def record_signal(self, direction: str) -> None:
+        if direction == "BUY":
+            self.data["buy_signals"] += 1
+        elif direction == "SELL":
+            self.data["sell_signals"] += 1
+        self.save()
+
+    def record_result(self, trade: dict, result: str, points: float) -> None:
+        if result == "TP":
+            self.data["wins"] += 1
+        else:
+            self.data["losses"] += 1
+        self.data["total"] += 1
+        self.data["total_points"] += points
+        self.data["total_pips"] += points / 10.0
+        self.data["best_trade_points"] = max(self.data["best_trade_points"], points)
+        self.data["worst_trade_points"] = min(self.data["worst_trade_points"], points)
+        self.data["win_rate"] = round(
+            (self.data["wins"] / self.data["total"]) * 100, 2
+        ) if self.data["total"] else 0.0
+
+        self.data["history"].append({
+            "id": trade.get("id"),
+            "direction": trade.get("direction"),
+            "entry": trade.get("entry"),
+            "exit": trade.get("take_profit") if result == "TP" else trade.get("stop_loss"),
+            "result": result,
+            "points": round(points, 1),
+            "pips": round(points / 10.0, 1),
+            "closed_at": fmt_th(now_th()),
+        })
+        self.data["history"] = self.data["history"][-100:]
+        self.save()
+
+    def summary(self) -> str:
+        d = self.data
+        return (f"✅ ชนะ: **{d['wins']}** | ❌ แพ้: **{d['losses']}** | รวม: **{d['total']}** ไม้\n"
+                f"🎯 Win Rate: **{d['win_rate']}%** | กำไรสะสม: **{d['total_points']:+.1f} pts**")
 
 
-# ==================================================================================================
-# 6. HTTP HEALTH CHECK SERVER & LIVE LOOP
-# ==================================================================================================
+# ==========================================================================================
+# SECTION 6.2 : DISCORD NOTIFIER
+# ==========================================================================================
+class DiscordNotifier:
+    COLOR_BUY = 0x00F0FF
+    COLOR_SELL = 0xFF0055
+    COLOR_INFO = 0x5865F2
+    COLOR_TP = 0x00FFA3
+    COLOR_SL = 0xFF2A6D
+
+    def __init__(self, webhook: str = None):
+        self.webhook = webhook or CFG.DISCORD_WEBHOOK
+        if not self.webhook:
+            log.warning("[Discord] ไม่พบ Webhook URL — จะแสดงในคอนโซลแทน")
+
+    def _post(self, embed: dict, content: str = "") -> bool:
+        if not self.webhook:
+            return False
+        body = {"embeds": [embed]}
+        if content:
+            body["content"] = content
+        for attempt in range(3):
+            try:
+                r = requests.post(self.webhook, json=body, timeout=12)
+                if r.status_code in (200, 204):
+                    return True
+                if r.status_code == 429:
+                    wait = safe_float(r.json().get("retry_after", 3), 3)
+                    time.sleep(wait + 1)
+                    continue
+            except Exception:
+                pass
+            time.sleep(2)
+        return False
+
+    def send_signal(self, trade: dict, ctx: dict, ai: dict, kz: dict, news_next: dict) -> None:
+        is_buy = trade["direction"] == "BUY"
+        emoji = "🟢 BUY LONG" if is_buy else "🔴 SELL SHORT"
+        color = self.COLOR_BUY if is_buy else self.COLOR_SELL
+
+        risk_pts = abs(trade["entry"] - trade["stop_loss"]) / CFG.POINT_VALUE
+        reward_pts = abs(trade["take_profit"] - trade["entry"]) / CFG.POINT_VALUE
+
+        news_txt = "ไม่มีข่าวแรงในระยะใกล้"
+        if news_next.get("title"):
+            news_txt = f"{news_next['title']} (อีก {news_next['minutes_away']} นาที)"
+
+        embed = {
+            "title": f"⚡ {emoji} // XAUUSD INSTITUTIONAL SETUP",
+            "description": (f"**กลยุทธ์:** `SMC + 24/7 Mode + AI Validation`\n"
+                            f"**เหตุผล:** {ai.get('reasoning_th', '-')}\n"
+                            f"**ระดับความมั่นใจ:** `{ai.get('confidence', '-')}%` ({ai.get('source', '-')})"),
+            "color": color,
+            "fields": [
+                {
+                    "name": "🎯 แผนราคา Spot Gold (Parameters)",
+                    "value": (f"```yaml\n"
+                              f"ENTRY : {trade['entry']:.2f}\n"
+                              f"SL    : {trade['stop_loss']:.2f} (-{risk_pts/100:.1f} pts)\n"
+                              f"TP    : {trade['take_profit']:.2f} (+{reward_pts/100:.1f} pts)\n"
+                              f"R:R   : 1:{trade['risk_reward']:.1f}\n"
+                              f"```"),
+                    "inline": False
+                },
+                {
+                    "name": "🏛️ สภาพคล่อง & โซนราคา (SMC Context)",
+                    "value": (f"• **H1 Bias:** `{ctx['htf_bias']}` (เหนือ EMA200: {ctx['htf_ema200']:.2f})\n"
+                              f"• **โซนสวิง:** `{ctx['pd_array']['zone']}` ({ctx['pd_array']['position_pct']:.1f}%)\n"
+                              f"• **การกวาด:** {ctx['sweep']['detail']}\n"
+                              f"• **FVG:** {ctx['fvg']['detail']}"),
+                    "inline": False
+                },
+                {
+                    "name": "🕐 Session & News",
+                    "value": f"Mode: **{kz['zone']}** │ ข่าว USD: `{news_txt}`",
+                    "inline": False
+                }
+            ],
+            "footer": {"text": "Spot Gold Quantitative Alpha • Asia/Bangkok"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._post(embed, content="@here 📢 **พบสัญญาณเทรดทองคำระดับสถาบัน (24/7)**")
+
+    def send_close(self, trade: dict, result: str, points: float, stats: PerformanceTracker) -> None:
+        win = result == "TP"
+        title = "🎯 [PROFIT LOCKED // TAKE PROFIT]" if win else "🛑 [STOP LOSS // RISK MITIGATED]"
+        color = self.COLOR_TP if win else self.COLOR_SL
+        exit_price = trade["take_profit"] if win else trade["stop_loss"]
+
+        embed = {
+            "title": title,
+            "description": f"```diff\n{'+' if win else '-'} RESULT: {result} ({trade['direction']} ORDER)\n"
+                            f"{'+' if win else '-'} PnL: {points:+.2f} PTS ({points/10:+.1f} PIPS)\n```",
+            "color": color,
+            "fields": [
+                {"name": "จุดเข้า", "value": f"`{trade['entry']:.2f}`", "inline": True},
+                {"name": "จุดปิด", "value": f"`{exit_price:.2f}`", "inline": True},
+                {"name": "ถือครอง", "value": trade.get("duration", "-"), "inline": True},
+                {"name": "📊 สถิติระบบสะสม", "value": stats.summary(), "inline": False},
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._post(embed)
+
+    def send_startup(self, stats: PerformanceTracker) -> None:
+        embed = {
+            "title": "🟢 BOT ONLINE // 24/7 INSTITUTIONAL SMC SYSTEM",
+            "description": (">>> **ระบบเทรดทองคำระดับสถาบัน (Spot Gold) เปิดทำงานตลอด 24 ชม. แล้ว!**\n"
+                            "• **สถาปัตยกรรม:** Dual-Timeframe (H1 Bias + M15 Execution)\n"
+                            "• **ตัวกรอง:** 24/7 Active Mode + Premium/Discount + News Blackout\n"
+                            "• **AI Brain:** Multi-Agent Chain-of-Thought Validation"),
+            "color": 0x00FF88,
+            "fields": [
+                {"name": "🎯 Trading Mode", "value": "24 Hours / 7 Days Active", "inline": True},
+                {"name": "⚖️ Min R:R", "value": f"1 : {CFG.MIN_RR}", "inline": True},
+                {"name": "📊 สถิติเดิม", "value": stats.summary(), "inline": False},
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._post(embed)
+
+    def send_heartbeat(self, stats: PerformanceTracker, price: float, kz: dict, active_trades: list) -> None:
+        embed = {
+            "title": "💓 HEARTBEAT // BOT IS ACTIVE & WATCHING (24/7)",
+            "description": (f">>> 📡 **สถานะ:** กำลังเฝ้าตลาดตลอด 24 ชม.\n"
+                            f"💰 **Spot Gold ล่าสุด:** `{price:.2f}`\n"
+                            f"🎯 **โหมดปัจจุบัน:** `{kz['zone']}`\n"
+                            f"📌 **ไม้ที่เปิดอยู่:** `{len(active_trades)} ไม้`\n\n"
+                            f"{stats.summary()}"),
+            "color": self.COLOR_INFO,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._post(embed)
+
+    def send_alert(self, title: str, msg: str) -> None:
+        self._post({
+            "title": title,
+            "description": msg[:1800],
+            "color": 0xF39C12,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+
+# ==========================================================================================
+# SECTION 6.3 : TRADE MANAGER
+# ==========================================================================================
+class TradeManager:
+    def __init__(self, notifier: DiscordNotifier, stats: PerformanceTracker):
+        self.notifier = notifier
+        self.stats = stats
+        self.path = CFG.TRADES_FILE
+        self.trades = self._load()
+        self.last_signal_time = None
+
+    def _load(self) -> list:
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return []
+
+    def _save(self) -> None:
+        with FILE_LOCK:
+            try:
+                with open(self.path, "w", encoding="utf-8") as f:
+                    json.dump(self.trades, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                log.error(f"[Trades] บันทึกไม่สำเร็จ: {e}")
+
+    def can_open(self) -> tuple:
+        if len(self.trades) >= CFG.MAX_CONCURRENT_TRADES:
+            return False, f"มีไม้เปิดอยู่ครบ {CFG.MAX_CONCURRENT_TRADES} ไม้แล้ว"
+        if self.last_signal_time:
+            elapsed = (now_th() - self.last_signal_time).total_seconds() / 60
+            if elapsed < CFG.SIGNAL_COOLDOWN_MIN:
+                return False, f"อยู่ใน Cooldown (เหลือ {CFG.SIGNAL_COOLDOWN_MIN - elapsed:.0f} นาที)"
+        return True, "พร้อมเปิดไม้ใหม่"
+
+    def open_trade(self, ai: dict, ctx: dict, kz: dict, news_next: dict) -> dict:
+        tid = f"XAU-{now_th().strftime('%y%m%d-%H%M%S')}"
+        trade = {
+            "id": tid,
+            "direction": ai["decision"],
+            "entry": ai["entry"],
+            "stop_loss": ai["stop_loss"],
+            "take_profit": ai["take_profit"],
+            "risk_reward": ai["risk_reward"],
+            "opened_at": fmt_th(now_th()),
+            "opened_ts": now_th().timestamp(),
+            "killzone": kz["zone"],
+            "htf_bias": ctx["htf_bias"],
+            "source": ai.get("source", "-"),
+            "status": "OPEN",
+        }
+        self.trades.append(trade)
+        self.last_signal_time = now_th()
+        self._save()
+        self.stats.record_signal(trade["direction"])
+        self.notifier.send_signal(trade, ctx, ai, kz, news_next)
+        log.info(f"[Trade] เปิดไม้ใหม่ {tid} {trade['direction']} @ {trade['entry']:.2f}")
+        return trade
+
+    def monitor(self, price: float) -> None:
+        if not self.trades or price <= 0:
+            return
+        remaining = []
+        for t in self.trades:
+            closed, result = False, None
+            if t["direction"] == "BUY":
+                if price >= t["take_profit"]:
+                    closed, result = True, "TP"
+                elif price <= t["stop_loss"]:
+                    closed, result = True, "SL"
+            else:
+                if price <= t["take_profit"]:
+                    closed, result = True, "TP"
+                elif price >= t["stop_loss"]:
+                    closed, result = True, "SL"
+
+            if closed:
+                exit_price = t["take_profit"] if result == "TP" else t["stop_loss"]
+                diff = (exit_price - t["entry"]) if t["direction"] == "BUY" else (t["entry"] - exit_price)
+                points = diff / CFG.POINT_VALUE
+                held = now_th().timestamp() - t.get("opened_ts", now_th().timestamp())
+                t["duration"] = f"{int(held // 3600)} ชม. {int((held % 3600) // 60)} นาที"
+
+                self.stats.record_result(t, result, points)
+                self.notifier.send_close(t, result, points, self.stats)
+                log.info(f"[Trade] ปิดไม้ {t['id']} {result} ({points:+.1f} pts)")
+            else:
+                remaining.append(t)
+
+        if len(remaining) != len(self.trades):
+            self.trades = remaining
+            self._save()
+
+
+# ==========================================================================================
+# SECTION 6.4 : KEEP-ALIVE WEB SERVER (แก้ปัญหา Port In Use อย่างถาวร)
+# ==========================================================================================
+BOT_STATE = {
+    "status": "starting",
+    "started_at": fmt_th(now_th()),
+    "last_scan": None,
+    "scan_count": 0,
+    "last_price": 0.0,
+    "killzone": "-",
+    "active_trades": 0,
+}
+
+
 class ReusableHTTPServer(HTTPServer):
     allow_reuse_address = True
 
 
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
+    def _send(self, code: int, body: bytes, ctype: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(b"SMC V7.6.1 Discord Bot Active and Healthy")
+        self.wfile.write(body)
 
-    def log_message(self, format, *args):
-        pass  # Suppress excessive HTTP GET logs
-
-
-def start_health_server():
-    try:
-        srv = ReusableHTTPServer(("0.0.0.0", BT_CFG.PORT), HealthHandler)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        logger.info(f"[Server] Health check server running on port {BT_CFG.PORT}")
-    except Exception as e:
-        logger.error(f"[Server] Port bind error: {e}")
-
-
-def is_killzone(cur_utc: datetime) -> Tuple[bool, str]:
-    tz_london = pytz.timezone("Europe/London")
-    tz_ny = pytz.timezone(BT_CFG.TRADING_DATE_TZ)
-    london_m = cur_utc.astimezone(tz_london).hour * 60 + cur_utc.astimezone(tz_london).minute
-    ny_m = cur_utc.astimezone(tz_ny).hour * 60 + cur_utc.astimezone(tz_ny).minute
-
-    is_london = (8 * 60) <= london_m <= (11 * 60 + 30)
-    is_ny = (8 * 60) <= ny_m <= (12 * 60)
-
-    if is_london and is_ny:
-        return True, "LONDON_NY_OVERLAP"
-    elif is_london:
-        return True, "LONDON_OPEN"
-    elif is_ny:
-        return True, "NY_OPEN"
-    return False, "OFF_PEAK"
-
-
-def live_bot_loop():
-    notifier = DiscordNotifier()
-    notifier.notify_startup()
-
-    params = {"sl_atr_buffer": 1.3, "min_displacement_ratio": 0.65, "min_rejection_wick_ratio": 0.30}
-    last_signal_setup_id = None
-
-    while True:
+    def do_GET(self):
+        path = self.path.split("?")[0].rstrip("/") or "/"
         try:
-            now_utc = datetime.now(timezone.utc)
-            in_kz, session_name = is_killzone(now_utc)
-            if not in_kz:
-                time.sleep(BT_CFG.SIGNAL_CHECK_INTERVAL_SEC)
-                continue
+            if path in ("/health", "/ping"):
+                self._send(200, b"OK", "text/plain; charset=utf-8")
+            elif path in ("/status", "/stats"):
+                body = json.dumps(BOT_STATE, ensure_ascii=False, indent=2).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+            else:
+                html = f"""<!doctype html><html><head><meta charset="utf-8"><title>SMC Gold Bot 24/7</title>
+<style>body{{background:#0d1117;color:#e6edf3;font-family:sans-serif;padding:30px}}
+.card{{background:#161b22;padding:20px;border-radius:10px;max-width:500px;margin:auto}}</style></head>
+<body><div class="card"><h2>🥇 Spot Gold SMC Quant Bot (24/7)</h2>
+<p>Status: <b>{BOT_STATE['status'].upper()}</b></p>
+<p>Last Price: <b>${BOT_STATE['last_price']:.2f}</b></p>
+<p>Mode: <b>{BOT_STATE['killzone']}</b></p>
+<p>Scans: <b>{BOT_STATE['scan_count']}</b></p>
+</div></body></html>"""
+                self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
+        except Exception:
+            self._send(500, b"ERROR", "text/plain; charset=utf-8")
 
-            tkr = yf.Ticker(BT_CFG.BENCHMARK)
-            raw_htf = tkr.history(period="10d", interval=BT_CFG.HTF_INTERVAL, auto_adjust=False)
-            raw_ltf = tkr.history(period="5d", interval=BT_CFG.LTF_INTERVAL, auto_adjust=False)
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
 
-            if raw_ltf.empty or raw_htf.empty:
-                time.sleep(60)
-                continue
+    def log_message(self, *args):
+        return
 
-            cutoff = get_research_cutoff_utc()
-            df_htf = validate_and_clean_market_data(raw_htf, "HTF_H1", 60, cutoff, is_intraday=True)
-            df_ltf = validate_and_clean_market_data(raw_ltf, "LTF_M15", 15, cutoff, is_intraday=True)
 
-            df_htf["EMA200"] = CausalIndicators.ema(df_htf["Close"], 200)
-            df_ltf["ATR"] = CausalIndicators.atr(df_ltf, 14)
+def is_port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
 
-            cur_bar_time = df_ltf.index[-1]
-            last_htf = CausalLiquidityEngine.get_last_closed_htf_bar(df_htf, cur_bar_time)
-            if last_htf is None or pd.isna(last_htf.get("EMA200")):
-                time.sleep(BT_CFG.SIGNAL_CHECK_INTERVAL_SEC)
-                continue
 
-            h1_bias = "BULLISH" if last_htf["Close"] > last_htf["EMA200"] else "BEARISH"
-            df_closed = df_ltf.copy()
+def start_web_server() -> None:
+    def _run():
+        if is_port_in_use(CFG.PORT):
+            log.info(f"[Web] พอร์ต {CFG.PORT} มีเซิร์ฟเวอร์เปิดรับ Ping อยู่แล้ว — ข้ามการเปิดซ้ำและเข้าสู่ลูปเทรด")
+            return
 
-            fractal_highs, fractal_lows = CausalLiquidityEngine.get_confirmed_fractals(df_closed, cur_bar_time)
-            eqh, eql = CausalLiquidityEngine.get_causal_equal_levels(df_closed, cur_bar_time)
-            levels = CausalLiquidityEngine.extract_closed_session_and_daily_levels(df_closed, cur_bar_time)
+        while True:
+            try:
+                srv = ReusableHTTPServer(("0.0.0.0", CFG.PORT), HealthHandler)
+                log.info(f"[Web] Keep-Alive Server พร้อมทำงานที่พอร์ต {CFG.PORT}")
+                srv.serve_forever()
+            except Exception as e:
+                if is_port_in_use(CFG.PORT):
+                    log.info(f"[Web] พอร์ต {CFG.PORT} ถูกใช้งานแล้ว ปล่อยให้ระบบทำงานต่อ")
+                    break
+                log.warning(f"[Web] Server รอรีสตาร์ท: {e}")
+                time.sleep(10)
 
-            valid_seq, reason, seq_data = CausalSequenceEngine.evaluate(
-                df_closed, h1_bias, levels, fractal_highs, fractal_lows, eqh, eql, params
-            )
+    threading.Thread(target=_run, daemon=True, name="WebServer").start()
 
-            if valid_seq and seq_data["setup_id"] != last_signal_setup_id:
-                last_signal_setup_id = seq_data["setup_id"]
-                direction = seq_data["direction"]
-                sl = seq_data["sl_price"]
-                cur_close = float(df_closed["Close"].iloc[-1])
 
-                quoted = cur_close + (BT_CFG.SPREAD_USD / 2.0) if direction == "BUY" else cur_close - (BT_CFG.SPREAD_USD / 2.0)
-                executed = quoted + BT_CFG.ADVERSE_SLIPPAGE_USD if direction == "BUY" else quoted - BT_CFG.ADVERSE_SLIPPAGE_USD
+# ==========================================================================================
+# SECTION 7 : MAIN ORCHESTRATOR
+# ==========================================================================================
+class GoldSMCBot:
+    def __init__(self):
+        self.feed = MarketDataFeed()
+        self.news = NewsBlackoutEngine()
+        self.ai = AIBrain()
+        self.stats = PerformanceTracker()
+        self.notifier = DiscordNotifier()
+        self.trades = TradeManager(self.notifier, self.stats)
+        self.scan_count = 0
+        self.last_heartbeat = time.time()
 
-                valid_target, _, tp_raw, _, _, _ = DynamicLiquidityTargetEngine.resolve_target(
-                    direction, cur_bar_time, executed, sl, levels, fractal_highs, fractal_lows, eqh, eql
+    def scan_once(self) -> None:
+        self.scan_count += 1
+        BOT_STATE["scan_count"] = self.scan_count
+        BOT_STATE["last_scan"] = fmt_th(now_th())
+        BOT_STATE["active_trades"] = len(self.trades.trades)
+
+        live = self.feed.get_live_price()
+        if live > 0:
+            BOT_STATE["last_price"] = live
+            self.trades.monitor(live)
+
+        kz = KillzoneFilter.check()
+        BOT_STATE["killzone"] = kz["zone"]
+        if not kz["active"]:
+            BOT_STATE["status"] = "WEEKEND_PAUSE"
+            log.info(f"[Scan #{self.scan_count}] ⏸️ {kz['reason']}")
+            return
+
+        bo = self.news.check_blackout()
+        if bo["blackout"]:
+            BOT_STATE["status"] = "NEWS_BLACKOUT"
+            log.info(f"[Scan #{self.scan_count}] 📰 {bo['reason']}")
+            return
+
+        ok, why = self.trades.can_open()
+        if not ok:
+            BOT_STATE["status"] = "COOLDOWN"
+            log.info(f"[Scan #{self.scan_count}] 🔒 {why}")
+            return
+
+        BOT_STATE["status"] = "SCANNING"
+        htf = self.feed.get_htf()
+        ltf = self.feed.get_ltf()
+        if htf.empty or ltf.empty:
+            log.warning(f"[Scan #{self.scan_count}] ข้อมูลราคาไม่ครบ ข้ามรอบนี้")
+            return
+
+        ctx = SMCEngine.evaluate(htf, ltf)
+        BOT_STATE["last_price"] = ctx["price"]
+
+        log.info(
+            f"[Scan #{self.scan_count}] 💰 {ctx['price']:.2f} | Mode={kz['zone']} | "
+            f"H1={ctx['htf_bias']} | Zone={ctx['pd_array']['zone']} "
+            f"({ctx['pd_array']['position_pct']:.0f}%) | RSI={ctx['ltf_rsi']:.1f} | "
+            f"Sweep(B/S)={ctx['sweep']['bullish_sweep']}/{ctx['sweep']['bearish_sweep']} | "
+            f"FVG={ctx['fvg']['type']}"
+        )
+
+        if ctx["direction"] == "NONE":
+            log.info(f"   ↳ ยังไม่ครบเกณฑ์ (ฝั่ง {ctx.get('best_side','-')} "
+                     f"ผ่าน {ctx.get('best_score','-')}) ขาด: {', '.join(ctx['reject_reasons'])}")
+            BOT_STATE["status"] = "NO_SETUP"
+            return
+
+        log.info(f"   ↳ ✅ พบ Confluence ฝั่ง {ctx['direction']} → ส่ง AI ตรวจสอบ")
+        news_next = self.news.next_event()
+        decision = self.ai.validate(ctx, kz, news_next)
+
+        if decision.get("decision") not in ("BUY", "SELL"):
+            log.info(f"   ↳ 🧠 AI สั่ง WAIT: {decision.get('reasoning_th', '-')}")
+            BOT_STATE["status"] = "AI_WAIT"
+            return
+
+        self.trades.open_trade(decision, ctx, kz, news_next)
+        BOT_STATE["status"] = "SIGNAL_SENT"
+        BOT_STATE["active_trades"] = len(self.trades.trades)
+
+    def maybe_heartbeat(self) -> None:
+        if (time.time() - self.last_heartbeat) >= CFG.HEARTBEAT_HOURS * 3600:
+            try:
+                self.notifier.send_heartbeat(
+                    self.stats, BOT_STATE["last_price"],
+                    KillzoneFilter.check(), self.trades.trades
                 )
-                tp = round(tp_raw, 2)
+                self.last_heartbeat = time.time()
+            except Exception as e:
+                log.warning(f"[Heartbeat] ส่งไม่สำเร็จ: {e}")
 
-                size_ok, _, lot, risk_usd, _ = CausalSizingEngine.calculate_lot(BT_CFG.INITIAL_CAPITAL, BT_CFG.RISK_PCT, executed, sl)
-                if size_ok:
-                    setup_info = {
-                        "direction": direction,
-                        "entry": round(executed, 2),
-                        "sl": sl,
-                        "tp": tp,
-                        "lot": lot,
-                        "risk_usd": risk_usd,
-                    }
-                    notifier.notify_signal(setup_info, session_name)
-                    logger.info(f"[LiveSignal] Dispatched {direction} signal to Discord successfully.")
+    def run(self) -> None:
+        log.info("=" * 70)
+        log.info("  INSTITUTIONAL SPOT GOLD (XAUUSD) SMC BOT (24/7 MODE) STARTING...")
+        log.info("=" * 70)
+        BOT_STATE["status"] = "running"
+        self.news.fetch(force=True)
+        self.notifier.send_startup(self.stats)
 
-        except Exception as e:
-            logger.error(f"[LiveLoop] Error: {e}")
+        while True:
+            cycle_start = time.time()
+            try:
+                self.scan_once()
+                self.maybe_heartbeat()
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                log.error(f"[Main] เกิดข้อผิดพลาด: {e}")
+                log.error(traceback.format_exc())
+                time.sleep(30)
 
-        time.sleep(BT_CFG.SIGNAL_CHECK_INTERVAL_SEC)
+            elapsed = time.time() - cycle_start
+            time.sleep(max(CFG.SCAN_INTERVAL_SEC - elapsed, 10))
+
+
+def main():
+    start_web_server()
+    time.sleep(1)
+    bot = GoldSMCBot()
+    bot.run()
 
 
 if __name__ == "__main__":
-    logger.info("Starting SMC Bot V7.6.1 Discord Edition...")
-    start_health_server()
-    live_bot_loop()
-```
-eof
+    main()
