@@ -6,8 +6,8 @@
  Upgrades in V7.6.1 Live Dispatcher:
    1. REAL-TIME DISCORD WEBHOOK INTEGRATION: Automatically formats and dispatches institutional
       setup notifications (BUY/SELL signals, entry parameters, SL/TP levels, and risk metrics).
-   2. EMBEDDED HTTP HEALTH CHECK SERVER: Runs a lightweight background web server on $PORT to satisfy
-      cloud platform health checks (Render, Railway, Fly.io) and prevent 24/7 sleep/spin-down.
+   2. EMBEDDED HTTP HEALTH CHECK SERVER: Runs a lightweight background web server on $PORT using 
+      ReusableHTTPServer to prevent [Errno 98] Address already in use errors on Render/Railway.
    3. 16 INVARIANT SUITES: Preserves strict no-lookahead, causality, and CME daily session rollover checks.
 ==================================================================================================
 """
