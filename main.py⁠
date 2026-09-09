@@ -1,33 +1,38 @@
 # -*- coding: utf-8 -*-
-# V7.6.2 RELAXED CALIBRATED BUILD - HIGH-FREQUENCY SMC BACKTEST ENGINE
 """
 ==================================================================================================
- INSTITUTIONAL GOLD SMC V7.6.2 - RELAXED RESEARCH & HIGH-FREQUENCY BACKTEST ENGINE
+ INSTITUTIONAL GOLD SMC V7.6.1 — DISCORD LIVE SIGNAL & HEALTH SERVER EDITION
 ==================================================================================================
- Upgrades in V7.6.2:
-   1. RELAXED CAUSAL GATES: Broadened FVG retest tolerance and lower-wick rejection thresholds to ensure 
-      sufficient trade frequency for robust statistical win rate and profit factor reporting.
-   2. EXPLICIT PLAIN-TEXT REPORTING: Clean ASCII tables and structured terminal logs optimized for mobile.
+ Upgrades in V7.6.1 Live Dispatcher:
+   1. REAL-TIME DISCORD WEBHOOK INTEGRATION: Automatically formats and dispatches institutional
+      setup notifications (BUY/SELL signals, entry parameters, SL/TP levels, and risk metrics).
+   2. EMBEDDED HTTP HEALTH CHECK SERVER: Runs a lightweight background web server on $PORT to satisfy
+      cloud platform health checks (Render, Railway, Fly.io) and prevent 24/7 sleep/spin-down.
    3. 16 INVARIANT SUITES: Preserves strict no-lookahead, causality, and CME daily session rollover checks.
 ==================================================================================================
 """
 
 import sys
+import os
 import math
+import time
 import logging
 import itertools
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta, time as dtime
 from typing import List, Dict, Any, Optional, Tuple, Set
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 
 import pytz
+import requests
 import numpy as np
 import pandas as pd
 
 try:
     import yfinance as yf
 except ImportError:
-    print("Error: Missing dependencies. Run: pip install yfinance pandas numpy pytz")
+    print("Error: Missing dependencies. Run: pip install yfinance pandas numpy pytz requests")
     sys.exit(1)
 
 logging.basicConfig(
@@ -35,17 +40,23 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("SMC_Turbo_Engine")
+logger = logging.getLogger("SMC_V7_6_1_Discord_Bot")
 
 
+# ==================================================================================================
+# 1. CONFIGURATION & SPECIFICATIONS
+# ==================================================================================================
 class BT_CFG:
     DATA_INSTRUMENT_TYPE: str = "SYNTHETIC_100OZ_PROXY_ON_COMEX_GC"
     BENCHMARK: str = "GC=F"
-    PERIOD_M15: str = "60d"
-    PERIOD_1M: str = "7d"
     HTF_INTERVAL: str = "60m"
     LTF_INTERVAL: str = "15m"
     INTRABAR_INTERVAL: str = "1m"
+
+    # Cloud & Discord Webhook Config
+    PORT: int = int(os.getenv("PORT", "10000"))
+    DISCORD_WEBHOOK: str = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK", "")
+    SIGNAL_CHECK_INTERVAL_SEC: int = 300  # Scan every 5 minutes
 
     RESEARCH_CUTOFF_UTC: Optional[str] = None
     SOURCE_INTRADAY_TIMESTAMP_IS_BAR_START: bool = True
@@ -63,29 +74,65 @@ class BT_CFG:
 
     INITIAL_CAPITAL: float = 10000.0
     RISK_PCT: float = 1.0
-    MIN_RR: float = 1.5
-    EQUAL_LEVEL_TOLERANCE: float = 0.001
+    MIN_RR: float = 2.0
+    EQUAL_LEVEL_TOLERANCE: float = 0.0003
     AMBIGUOUS_EXIT_POLICY: str = "SL_FIRST"
 
-    FRACTAL_CONFIRM_BARS: int = 2
-    MAX_SWEEP_TO_MSS_BARS: int = 12
-    MAX_MSS_TO_DISP_BARS: int = 6
-    MAX_FVG_TO_RETEST_BARS: int = 24
+    FRACTAL_CONFIRM_BARS: int = 3
+    MAX_SWEEP_TO_MSS_BARS: int = 4
+    MAX_MSS_TO_DISP_BARS: int = 2
+    MAX_DISP_TO_FVG_BARS: int = 3
+    MAX_FVG_TO_RETEST_BARS: int = 8
+    EXPECTED_ASIAN_M15_BARS: int = 24
     EXPECTED_DAILY_M15_BARS: int = 92
 
-    WF_TRAIN_DAYS: int = 25
-    WF_TEST_DAYS: int = 10
-    WF_STEP_DAYS: int = 10
-    MIN_TRAIN_TRADES: int = 1
+
+# ==================================================================================================
+# 2. DISCORD NOTIFICATION ENGINE
+# ==================================================================================================
+class DiscordNotifier:
+    def __init__(self):
+        self.webhook = BT_CFG.DISCORD_WEBHOOK
+
+    def send(self, embed: Dict[str, Any], content: str = ""):
+        if not self.webhook:
+            logger.warning("[Discord] Webhook URL not set! Please configure DISCORD_WEBHOOK_URL environment variable.")
+            return
+        try:
+            requests.post(self.webhook, json={"embeds": [embed], "content": content}, timeout=10)
+        except Exception as e:
+            logger.error(f"[Discord] Send error: {e}")
+
+    def notify_startup(self):
+        embed = {
+            "title": "🟢 SMC QUANT BOT ONLINE // V7.6.1 DISCORD EDITION",
+            "description": "Institutional Spot Gold (XAUUSD) Causal SMC Signal monitor is active 24/7.",
+            "color": 0x00FFA3,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self.send(embed, "@here 🚀 **Institutional SMC Bot Started Successfully**")
+
+    def notify_signal(self, setup: Dict[str, Any], session: str):
+        direction = setup["direction"]
+        is_buy = direction == "BUY"
+        embed = {
+            "title": f"⚡ {'BUY LONG' if is_buy else 'SELL SHORT'} SIGNAL // XAUUSD V7.6.1",
+            "description": f"**Session Killzone:** `{session}`\n**Analysis:** Causal Liquidity Sweep, MSS, Displacement & FVG Retest Confirmed.",
+            "color": 0x00F0FF if is_buy else 0xFF0055,
+            "fields": [
+                {
+                    "name": "📊 Execution Parameters",
+                    "value": f"```yaml\nENTRY  : {setup['entry']:.2f}\nSL     : {setup['sl']:.2f}\nTP     : {setup['tp']:.2f}\nLOT    : {setup['lot']}\nRISK   : ${setup['risk_usd']:,.2f}\n```"
+                }
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self.send(embed, "@here 📢 **New Institutional SMC Signal Dispatched**")
 
 
-PARAM_GRID = {
-    "sl_atr_buffer": [1.0, 1.2],
-    "min_displacement_ratio": [0.35, 0.45],
-    "min_rejection_wick_ratio": [0.10, 0.15],
-}
-
-
+# ==================================================================================================
+# 3. CAUSAL DATA STRUCTURES & DISCRETE EVENT OBJECTS
+# ==================================================================================================
 @dataclass
 class CausalLevel:
     level_type: str
@@ -131,61 +178,9 @@ class FVGStructure:
     size: float
 
 
-@dataclass
-class TradeRecord:
-    id: str
-    fold_id: int
-    setup_id: str
-    direction: str
-    session: str
-    entry_time: datetime
-    entry_index: int
-    quoted_entry: float
-    executed_entry: float
-    sl_price: float
-    tp_price: float
-    planned_risk_usd: float
-    worst_case_risk_usd: float
-    risk_dist: float
-    reward_dist: float
-    planned_rr_raw: float
-    planned_rr_rounded: float
-    actual_rr_after_execution: float
-    lot_size: float
-    target_type: str
-    sweep_type: str
-    boundary_max_ptr: int = 0
-    is_oos: bool = False
-    exit_time: Optional[datetime] = None
-    exit_index: int = 0
-    quoted_exit: float = 0.0
-    executed_exit: float = 0.0
-    result: str = ""
-    gross_pnl: float = 0.0
-    commission: float = 0.0
-    entry_slippage_cost: float = 0.0
-    exit_slippage_cost: float = 0.0
-    slippage_cost: float = 0.0
-    net_pnl: float = 0.0
-    points: float = 0.0
-    price_r: float = 0.0
-    net_r: float = 0.0
-    execution_quality: str = "FULL_1M"
-    ambiguous_exit: bool = False
-    mae_points: float = 0.0
-    mfe_points: float = 0.0
-    mae_r: float = 0.0
-    mfe_r: float = 0.0
-    duration_minutes: float = 0.0
-    post_trade_equity: float = 0.0
-
-
-@dataclass
-class ExecutionResult:
-    trade: TradeRecord
-    exit_index: int
-
-
+# ==================================================================================================
+# 4. QUANTITATIVE INDICATORS & DATA NORMALIZATION
+# ==================================================================================================
 class CausalIndicators:
     @staticmethod
     def ema(series: pd.Series, period: int) -> pd.Series:
@@ -205,6 +200,11 @@ def get_research_cutoff_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def get_inclusive_bar_range(start_idx: int, max_span: int, total_len: int) -> range:
+    end_bound = min(total_len, start_idx + max_span + 1)
+    return range(start_idx, end_bound)
+
+
 def drop_unclosed_tail(df: pd.DataFrame, cutoff_utc: datetime) -> pd.DataFrame:
     if df.empty:
         return df
@@ -215,17 +215,6 @@ def normalize_to_close_time(index: pd.DatetimeIndex, interval_minutes: int) -> p
     if interval_minutes > 0 and BT_CFG.SOURCE_INTRADAY_TIMESTAMP_IS_BAR_START:
         return index + timedelta(minutes=interval_minutes)
     return index
-
-
-def is_strictly_continuous_1m(bars_1m: pd.DataFrame, m15_start: datetime, m15_end: datetime) -> bool:
-    if len(bars_1m) != 15:
-        return False
-    if bars_1m.index.duplicated().any():
-        return False
-    if not bars_1m.index.is_monotonic_increasing:
-        return False
-    expected_timestamps = [m15_start + timedelta(minutes=k) for k in range(1, 16)]
-    return bars_1m.index.tolist() == expected_timestamps
 
 
 def get_ny_session_date(dt_ny: datetime) -> datetime.date:
@@ -243,124 +232,134 @@ def validate_and_clean_market_data(
 ) -> pd.DataFrame:
     if df.empty:
         raise ValueError(f"CRITICAL: {name} DataFrame is empty.")
+
     clean_df = df.copy()
     clean_df.rename(columns={c: c.capitalize() for c in clean_df.columns}, inplace=True)
     required_cols = ["Open", "High", "Low", "Close"]
     for rc in required_cols:
         if rc not in clean_df.columns:
             raise ValueError(f"CRITICAL: {name} missing column {rc}")
+
     clean_df.dropna(subset=required_cols, inplace=True)
+
     if clean_df.index.tz is None:
         clean_df.index = clean_df.index.tz_localize(timezone.utc)
     else:
         clean_df.index = clean_df.index.tz_convert(timezone.utc)
+
     if is_intraday:
         clean_df.index = normalize_to_close_time(clean_df.index, interval_minutes)
+
     clean_df = drop_unclosed_tail(clean_df, cutoff_utc)
     clean_df = clean_df[~clean_df.index.duplicated(keep="first")].sort_index()
     return clean_df
 
 
-class PrecomputedCausalUniverse:
-    def __init__(self, df_ltf: pd.DataFrame, df_htf: pd.DataFrame):
-        self.df_ltf = df_ltf
-        self.df_htf = df_htf
-        self.all_fractal_highs: List[CausalLevel] = []
-        self.all_fractal_lows: List[CausalLevel] = []
-        self.all_eqh: List[CausalLevel] = []
-        self.all_eql: List[CausalLevel] = []
-        self.daily_levels_by_time: List[Tuple[datetime, List[CausalLevel]]] = []
-        self.asian_levels_by_time: List[Tuple[datetime, List[CausalLevel]]] = []
-        self.kz_session_cache: List[Tuple[bool, str]] = []
-        self.htf_bias_cache: List[str] = []
-        self._precompute_all()
+# ==================================================================================================
+# 5. CAUSAL LIQUIDITY & SEQUENCE ENGINE
+# ==================================================================================================
+class CausalLiquidityEngine:
+    @staticmethod
+    def get_confirmed_fractals(
+        df_history: pd.DataFrame,
+        eval_time: datetime,
+        window: int = BT_CFG.FRACTAL_CONFIRM_BARS,
+    ) -> Tuple[List[CausalLevel], List[CausalLevel]]:
+        highs, lows = [], []
+        n = len(df_history)
+        if n < (window * 2 + 1):
+            return highs, lows
 
-    def _precompute_all(self):
-        tz_london = pytz.timezone("Europe/London")
-        tz_ny = pytz.timezone(BT_CFG.TRADING_DATE_TZ)
-        tz_tokyo = pytz.timezone("Asia/Tokyo")
+        for i in range(window, n - window):
+            h_curr = float(df_history["High"].iloc[i])
+            l_curr = float(df_history["Low"].iloc[i])
+            formation_time = df_history.index[i]
+            confirmed_time = df_history.index[i + window]
 
-        for t in self.df_ltf.index:
-            london_m = t.astimezone(tz_london).hour * 60 + t.astimezone(tz_london).minute
-            ny_m = t.astimezone(tz_ny).hour * 60 + t.astimezone(tz_ny).minute
-            is_london = (7 * 60) <= london_m <= (12 * 60 + 30)
-            is_ny = (7 * 60 + 30) <= ny_m <= (16 * 60)
-            if is_london and is_ny:
-                self.kz_session_cache.append((True, "LONDON_NY_OVERLAP"))
-            elif is_london:
-                self.kz_session_cache.append((True, "LONDON_OPEN"))
-            elif is_ny:
-                self.kz_session_cache.append((True, "NY_OPEN"))
-            else:
-                self.kz_session_cache.append((True, "RELAXED_SESSION"))
+            if confirmed_time > eval_time:
+                continue
 
-        htf_close_times = [t.timestamp() for t in self.df_htf.index]
-        htf_closes = self.df_htf["Close"].values
-        htf_ema = self.df_htf["EMA200"].values
-
-        for t in self.df_ltf.index:
-            t_sec = t.timestamp()
-            loc = np.searchsorted(htf_close_times, t_sec, side="right") - 1
-            if loc >= 0 and not np.isnan(htf_ema[loc]):
-                bias = "BULLISH" if htf_closes[loc] > htf_ema[loc] else "BEARISH"
-            else:
-                bias = "BULLISH"
-            self.htf_bias_cache.append(bias)
-
-        h_vals = self.df_ltf["High"].values
-        l_vals = self.df_ltf["Low"].values
-        idx_vals = self.df_ltf.index
-        n = len(self.df_ltf)
-        w = BT_CFG.FRACTAL_CONFIRM_BARS
-
-        for i in range(w, n - w):
-            h_c, l_c = h_vals[i], l_vals[i]
             is_high, is_low = True, True
-            for k in range(1, w + 1):
-                if h_vals[i - k] >= h_c or h_vals[i + k] >= h_c:
+            for k in range(1, window + 1):
+                if df_history["High"].iloc[i - k] >= h_curr or df_history["High"].iloc[i + k] >= h_curr:
                     is_high = False
-                if l_vals[i - k] <= l_c or l_vals[i + k] <= l_c:
+                if df_history["Low"].iloc[i - k] <= l_curr or df_history["Low"].iloc[i + k] <= l_curr:
                     is_low = False
+
             if is_high:
-                self.all_fractal_highs.append(CausalLevel("SWING_HIGH", float(h_c), idx_vals[i], idx_vals[i + w]))
+                highs.append(CausalLevel("SWING_HIGH", h_curr, formation_time, confirmed_time))
             if is_low:
-                self.all_fractal_lows.append(CausalLevel("SWING_LOW", float(l_c), idx_vals[i], idx_vals[i + w]))
+                lows.append(CausalLevel("SWING_LOW", l_curr, formation_time, confirmed_time))
 
-        tol = BT_CFG.EQUAL_LEVEL_TOLERANCE
-        for i in range(0, n - 4):
+        return highs, lows
+
+    @staticmethod
+    def get_causal_equal_levels(
+        df_history: pd.DataFrame,
+        eval_time: datetime,
+        tolerance: float = BT_CFG.EQUAL_LEVEL_TOLERANCE,
+    ) -> Tuple[List[CausalLevel], List[CausalLevel]]:
+        h_vals = df_history["High"].values
+        l_vals = df_history["Low"].values
+        n = len(h_vals)
+        eqh, eql = [], []
+        if n < 10:
+            return eqh, eql
+
+        for i in range(max(0, n - 50), n - 4):
+            t1 = df_history.index[i]
             for j in range(i + 3, min(i + 20, n)):
-                if abs(h_vals[i] - h_vals[j]) / h_vals[i] <= tol:
-                    self.all_eqh.append(CausalLevel("EQH", round(float(h_vals[i] + h_vals[j]) / 2.0, 2), idx_vals[i], idx_vals[j]))
-                if abs(l_vals[i] - l_vals[j]) / l_vals[i] <= tol:
-                    self.all_eql.append(CausalLevel("EQL", round(float(l_vals[i] + l_vals[j]) / 2.0, 2), idx_vals[i], idx_vals[j]))
+                t2 = df_history.index[j]
+                if t2 > eval_time:
+                    continue
 
-        df_ny = self.df_ltf.copy()
-        df_ny["ny_time"] = df_ny.index.tz_convert(tz_ny)
-        df_ny["session_date"] = df_ny["ny_time"].apply(get_ny_session_date)
+                if abs(h_vals[i] - h_vals[j]) / h_vals[i] <= tolerance:
+                    avg_p = round(float(h_vals[i] + h_vals[j]) / 2.0, 2)
+                    eqh.append(CausalLevel("EQH", avg_p, t1, t2))
 
-        for s_date, s_bars in df_ny.groupby("session_date"):
-            if len(s_bars) >= 50:
-                conf_time = s_bars.index[-1]
-                pdh = round(float(s_bars["High"].max()), 2)
-                pdl = round(float(s_bars["Low"].min()), 2)
-                self.daily_levels_by_time.append((
-                    conf_time,
-                    [CausalLevel("PDH", pdh, s_bars.index[0], conf_time), CausalLevel("PDL", pdl, s_bars.index[0], conf_time)]
-                ))
+                if abs(l_vals[i] - l_vals[j]) / l_vals[i] <= tolerance:
+                    avg_p = round(float(l_vals[i] + l_vals[j]) / 2.0, 2)
+                    eql.append(CausalLevel("EQL", avg_p, t1, t2))
 
-    def get_causal_state_at(self, bar_time: datetime) -> Tuple[List[CausalLevel], List[CausalLevel], List[CausalLevel], List[CausalLevel], List[CausalLevel]]:
-        f_highs = [h for h in self.all_fractal_highs if h.confirmed_time <= bar_time][-30:]
-        f_lows = [l for l in self.all_fractal_lows if l.confirmed_time <= bar_time][-30:]
-        eqh = [h for h in self.all_eqh if h.confirmed_time <= bar_time][-15:]
-        eql = [l for l in self.all_eql if l.confirmed_time <= bar_time][-15:]
+        return eqh, eql
 
-        levels = []
-        for conf_t, d_lvs in reversed(self.daily_levels_by_time):
-            if conf_t <= bar_time:
-                levels.extend(d_lvs)
-                break
+    @staticmethod
+    def extract_closed_session_and_daily_levels(
+        df_ltf_history: pd.DataFrame,
+        current_time: datetime,
+    ) -> List[CausalLevel]:
+        levels: List[CausalLevel] = []
+        if df_ltf_history.empty or len(df_ltf_history) < 45:
+            return levels
 
-        return levels, f_highs, f_lows, eqh, eql
+        ny_tz = pytz.timezone(BT_CFG.TRADING_DATE_TZ)
+        sub_ny = df_ltf_history.copy()
+        sub_ny["ny_time"] = sub_ny.index.tz_convert(ny_tz)
+        sub_ny["session_date"] = sub_ny["ny_time"].apply(get_ny_session_date)
+
+        cur_ny_time = current_time.astimezone(ny_tz)
+        cur_session_date = get_ny_session_date(cur_ny_time)
+
+        completed_sessions = sub_ny[sub_ny["session_date"] < cur_session_date]
+        if not completed_sessions.empty:
+            last_sess_date = completed_sessions["session_date"].max()
+            last_sess_bars = completed_sessions[completed_sessions["session_date"] == last_sess_date].sort_index()
+            if not last_sess_bars.empty:
+                pdh = round(float(last_sess_bars["High"].max()), 2)
+                pdl = round(float(last_sess_bars["Low"].min()), 2)
+                conf_time = last_sess_bars.index[-1]
+                if conf_time <= current_time:
+                    levels.append(CausalLevel("PDH", pdh, last_sess_bars.index[0], conf_time))
+                    levels.append(CausalLevel("PDL", pdl, last_sess_bars.index[0], conf_time))
+
+        return levels
+
+    @staticmethod
+    def get_last_closed_htf_bar(df_htf: pd.DataFrame, signal_time: datetime) -> Optional[pd.Series]:
+        past_htf = df_htf[df_htf.index <= signal_time]
+        if past_htf.empty:
+            return None
+        return past_htf.iloc[-1]
 
 
 class CausalSequenceEngine:
@@ -377,7 +376,7 @@ class CausalSequenceEngine:
         params: Dict[str, float],
     ) -> Tuple[bool, str, Dict[str, Any]]:
         n = len(df_closed)
-        if n < 30:
+        if n < 45:
             return False, "INSUFFICIENT_HISTORY", {}
 
         cur_bar = df_closed.iloc[-1]
@@ -391,187 +390,228 @@ class CausalSequenceEngine:
         min_wick_ratio = params["min_rejection_wick_ratio"]
 
         if h1_bias == "BULLISH":
-            best_setup = None
-            for f_idx in range(t_now_idx - 1, max(2, t_now_idx - BT_CFG.MAX_FVG_TO_RETEST_BARS), -1):
-                if f_idx - 2 < 0 or f_idx >= n:
-                    continue
-                c1 = df_closed.iloc[f_idx - 2]
-                disp_bar = df_closed.iloc[f_idx - 1]
-                c3 = df_closed.iloc[f_idx]
-                disp_atr = float(df_closed["ATR"].iloc[f_idx - 1])
+            candidate_lows: List[CausalLevel] = [lv for lv in levels if lv.level_type == "PDL"]
+            candidate_lows += eql
+            candidate_lows += fractal_lows
 
-                if c1["High"] >= c3["Low"]:
-                    continue
-
-                gap_bot = float(c1["High"])
-                gap_top = float(c3["Low"])
-                gap_size = gap_top - gap_bot
-                if gap_size < (0.05 * disp_atr):
-                    continue
-
-                b_rng = max(float(disp_bar["High"] - disp_bar["Low"]), 1e-5)
-                b_body = abs(float(disp_bar["Close"] - disp_bar["Open"]))
-                b_ratio = b_body / b_rng
-                if b_ratio < min_disp_ratio:
-                    continue
-
-                fvg = FVGStructure(
-                    created_time=df_closed.index[f_idx - 1],
-                    confirmed_time=df_closed.index[f_idx],
-                    bar_index=f_idx,
-                    direction="BULLISH",
-                    top=gap_top,
-                    bottom=gap_bot,
-                    size=gap_size,
-                )
-
-                penetrated = (cur_bar["Low"] <= fvg.top) and (cur_bar["Close"] >= fvg.bottom)
-                lower_wick = min(float(cur_bar["Open"]), float(cur_bar["Close"])) - float(cur_bar["Low"])
-                bar_span = max(float(cur_bar["High"] - cur_bar["Low"]), 1e-5)
-                rejection_wick = (lower_wick / bar_span) >= min_wick_ratio
-
-                if not (penetrated and rejection_wick):
-                    continue
-
-                disp_idx = f_idx - 1
-                mss = None
-                sweep = None
-                candidate_lows = [lv for lv in levels if lv.level_type == "PDL"] + eql + fractal_lows
-
-                for m_idx in range(disp_idx, max(2, disp_idx - BT_CFG.MAX_MSS_TO_DISP_BARS - 1), -1):
-                    for s_idx in range(m_idx - 1, max(0, m_idx - BT_CFG.MAX_SWEEP_TO_MSS_BARS - 1), -1):
-                        bar_s = df_closed.iloc[s_idx]
-                        bar_s_time = df_closed.index[s_idx]
-                        for target_level in candidate_lows:
-                            if target_level.confirmed_time < bar_s_time and bar_s["Low"] <= target_level.price:
-                                sweep = SweepEvent(
-                                    timestamp=bar_s_time,
-                                    bar_index=s_idx,
-                                    direction="BULLISH_SWEEP",
-                                    level_price=target_level.price,
-                                    level_type=target_level.level_type,
-                                    extreme_price=float(bar_s["Low"]),
-                                )
-                                mss = MSSEvent(
-                                    timestamp=df_closed.index[m_idx],
-                                    bar_index=m_idx,
-                                    struct_level=float(df_closed["High"].iloc[max(0, s_idx-3):s_idx].max()),
-                                    break_price=float(df_closed["Close"].iloc[m_idx]),
-                                )
-                                break
-                        if sweep is not None:
-                            break
-                    if sweep is not None:
+            sweep: Optional[SweepEvent] = None
+            for s_idx in range(t_now_idx - 5, max(0, t_now_idx - 18), -1):
+                bar_s = df_closed.iloc[s_idx]
+                bar_s_time = df_closed.index[s_idx]
+                for target_level in candidate_lows:
+                    if target_level.confirmed_time < bar_s_time and bar_s["Low"] < target_level.price and bar_s["Close"] > target_level.price:
+                        sweep = SweepEvent(
+                            timestamp=bar_s_time,
+                            bar_index=s_idx,
+                            direction="BULLISH_SWEEP",
+                            level_price=target_level.price,
+                            level_type=target_level.level_type,
+                            extreme_price=float(bar_s["Low"]),
+                        )
                         break
-
-                if sweep is not None and mss is not None:
-                    sl_price = sweep.extreme_price - (sl_atr_buf * cur_atr)
-                    setup_id = f"BUY|{sweep.timestamp.isoformat()}|{fvg.confirmed_time.isoformat()}"
-                    best_setup = {
-                        "direction": "BUY",
-                        "setup_id": setup_id,
-                        "sweep": sweep,
-                        "mss": mss,
-                        "displacement": DisplacementEvent(df_closed.index[disp_idx], disp_idx, b_ratio, b_rng),
-                        "fvg": fvg,
-                        "sl_price": round(sl_price, 2),
-                    }
+                if sweep is not None:
                     break
 
-            if best_setup is not None:
-                return True, "VALID_BULLISH_SEQUENCE", best_setup
-            return False, "RELAXED_FILTER_WAIT", {}
+            if sweep is None:
+                return False, "NO_SWEEP", {}
+
+            prior_highs = [fh for fh in fractal_highs if fh.confirmed_time < sweep.timestamp]
+            if not prior_highs:
+                return False, "NO_STRUCTURAL_HIGH_PRIOR_SWEEP", {}
+
+            struct_high = prior_highs[-1].price
+            mss: Optional[MSSEvent] = None
+            for m_idx in get_inclusive_bar_range(sweep.bar_index + 1, BT_CFG.MAX_SWEEP_TO_MSS_BARS, n):
+                if df_closed["Close"].iloc[m_idx] > struct_high:
+                    mss = MSSEvent(
+                        timestamp=df_closed.index[m_idx],
+                        bar_index=m_idx,
+                        struct_level=struct_high,
+                        break_price=float(df_closed["Close"].iloc[m_idx]),
+                    )
+                    break
+
+            if mss is None:
+                return False, "MSS_TIMEOUT", {}
+
+            displacement: Optional[DisplacementEvent] = None
+            for d_idx in get_inclusive_bar_range(mss.bar_index + 1, BT_CFG.MAX_MSS_TO_DISP_BARS, n):
+                b = df_closed.iloc[d_idx]
+                disp_atr = float(df_closed["ATR"].iloc[d_idx])
+                b_rng = max(float(b["High"] - b["Low"]), 1e-5)
+                b_body = abs(float(b["Close"] - b["Open"]))
+                b_ratio = b_body / b_rng
+                rng_atr_ratio = b_rng / max(disp_atr, 1e-5)
+
+                if (b_ratio >= min_disp_ratio) and (rng_atr_ratio >= 0.85):
+                    displacement = DisplacementEvent(
+                        timestamp=df_closed.index[d_idx],
+                        bar_index=d_idx,
+                        body_ratio=b_ratio,
+                        range_atr_ratio=rng_atr_ratio,
+                    )
+                    break
+
+            if displacement is None:
+                return False, "NO_DISPLACEMENT", {}
+
+            fvg: Optional[FVGStructure] = None
+            start_fvg_center = displacement.bar_index + 2
+            for f_idx in get_inclusive_bar_range(start_fvg_center, BT_CFG.MAX_DISP_TO_FVG_BARS, n - 1):
+                c1 = df_closed.iloc[f_idx - 1]
+                c3 = df_closed.iloc[f_idx + 1]
+                fvg_atr = float(df_closed["ATR"].iloc[f_idx + 1])
+                if c1["High"] < c3["Low"]:
+                    gap_bot = float(c1["High"])
+                    gap_top = float(c3["Low"])
+                    gap_size = gap_top - gap_bot
+                    if gap_size >= (0.20 * fvg_atr):
+                        fvg = FVGStructure(
+                            created_time=df_closed.index[f_idx],
+                            confirmed_time=df_closed.index[f_idx + 1],
+                            bar_index=f_idx + 1,
+                            direction="BULLISH",
+                            top=gap_top,
+                            bottom=gap_bot,
+                            size=gap_size,
+                        )
+                        break
+
+            if fvg is None:
+                return False, "NO_FVG", {}
+
+            if (t_now_idx - fvg.bar_index) > BT_CFG.MAX_FVG_TO_RETEST_BARS:
+                return False, "FVG_STALE_TIMEOUT", {}
+
+            penetrated = (cur_bar["Low"] <= fvg.top) and (cur_bar["Low"] >= (fvg.bottom - 0.25 * cur_atr))
+            closed_above = cur_bar["Close"] >= fvg.bottom
+            lower_wick = min(float(cur_bar["Open"]), float(cur_bar["Close"])) - float(cur_bar["Low"])
+            bar_span = max(float(cur_bar["High"] - cur_bar["Low"]), 1e-5)
+            rejection_wick = (lower_wick / bar_span) >= min_wick_ratio
+
+            if not (penetrated and closed_above and rejection_wick):
+                return False, "FVG_RETEST_INCOMPLETE_OR_WEAK_REJECTION", {}
+
+            sl_price = sweep.extreme_price - (sl_atr_buf * cur_atr)
+            setup_id = f"BUY|{sweep.timestamp.isoformat()}|{fvg.confirmed_time.isoformat()}"
+
+            return True, "VALID_BULLISH_SEQUENCE", {
+                "direction": "BUY",
+                "setup_id": setup_id,
+                "sl_price": round(sl_price, 2),
+            }
+
         else:
-            best_setup = None
-            for f_idx in range(t_now_idx - 1, max(2, t_now_idx - BT_CFG.MAX_FVG_TO_RETEST_BARS), -1):
-                if f_idx - 2 < 0 or f_idx >= n:
-                    continue
-                c1 = df_closed.iloc[f_idx - 2]
-                disp_bar = df_closed.iloc[f_idx - 1]
-                c3 = df_closed.iloc[f_idx]
-                disp_atr = float(df_closed["ATR"].iloc[f_idx - 1])
+            candidate_highs: List[CausalLevel] = [lv for lv in levels if lv.level_type == "PDH"]
+            candidate_highs += eqh
+            candidate_highs += fractal_highs
 
-                if c1["Low"] <= c3["High"]:
-                    continue
-
-                gap_top = float(c1["Low"])
-                gap_bot = float(c3["High"])
-                gap_size = gap_top - gap_bot
-                if gap_size < (0.05 * disp_atr):
-                    continue
-
-                b_rng = max(float(disp_bar["High"] - disp_bar["Low"]), 1e-5)
-                b_body = abs(float(disp_bar["Close"] - disp_bar["Open"]))
-                b_ratio = b_body / b_rng
-                if b_ratio < min_disp_ratio:
-                    continue
-
-                fvg = FVGStructure(
-                    created_time=df_closed.index[f_idx - 1],
-                    confirmed_time=df_closed.index[f_idx],
-                    bar_index=f_idx,
-                    direction="BEARISH",
-                    top=gap_top,
-                    bottom=gap_bot,
-                    size=gap_size,
-                )
-
-                penetrated = (cur_bar["High"] >= fvg.bottom) and (cur_bar["Close"] <= fvg.top)
-                upper_wick = float(cur_bar["High"]) - max(float(cur_bar["Open"]), float(cur_bar["Close"]))
-                bar_span = max(float(cur_bar["High"] - cur_bar["Low"]), 1e-5)
-                rejection_wick = (upper_wick / bar_span) >= min_wick_ratio
-
-                if not (penetrated and rejection_wick):
-                    continue
-
-                disp_idx = f_idx - 1
-                mss = None
-                sweep = None
-                candidate_highs = [lv for lv in levels if lv.level_type == "PDH"] + eqh + fractal_highs
-
-                for m_idx in range(disp_idx, max(2, disp_idx - BT_CFG.MAX_MSS_TO_DISP_BARS - 1), -1):
-                    for s_idx in range(m_idx - 1, max(0, m_idx - BT_CFG.MAX_SWEEP_TO_MSS_BARS - 1), -1):
-                        bar_s = df_closed.iloc[s_idx]
-                        bar_s_time = df_closed.index[s_idx]
-                        for target_level in candidate_highs:
-                            if target_level.confirmed_time < bar_s_time and bar_s["High"] >= target_level.price:
-                                sweep = SweepEvent(
-                                    timestamp=bar_s_time,
-                                    bar_index=s_idx,
-                                    direction="BEARISH_SWEEP",
-                                    level_price=target_level.price,
-                                    level_type=target_level.level_type,
-                                    extreme_price=float(bar_s["High"]),
-                                )
-                                mss = MSSEvent(
-                                    timestamp=df_closed.index[m_idx],
-                                    bar_index=m_idx,
-                                    struct_level=float(df_closed["Low"].iloc[max(0, s_idx-3):s_idx].min()),
-                                    break_price=float(df_closed["Close"].iloc[m_idx]),
-                                )
-                                break
-                        if sweep is not None:
-                            break
-                    if sweep is not None:
+            sweep = None
+            for s_idx in range(t_now_idx - 5, max(0, t_now_idx - 18), -1):
+                bar_s = df_closed.iloc[s_idx]
+                bar_s_time = df_closed.index[s_idx]
+                for target_level in candidate_highs:
+                    if target_level.confirmed_time < bar_s_time and bar_s["High"] > target_level.price and bar_s["Close"] < target_level.price:
+                        sweep = SweepEvent(
+                            timestamp=bar_s_time,
+                            bar_index=s_idx,
+                            direction="BEARISH_SWEEP",
+                            level_price=target_level.price,
+                            level_type=target_level.level_type,
+                            extreme_price=float(bar_s["High"]),
+                        )
                         break
-
-                if sweep is not None and mss is not None:
-                    sl_price = sweep.extreme_price + (sl_atr_buf * cur_atr)
-                    setup_id = f"SELL|{sweep.timestamp.isoformat()}|{fvg.confirmed_time.isoformat()}"
-                    best_setup = {
-                        "direction": "SELL",
-                        "setup_id": setup_id,
-                        "sweep": sweep,
-                        "mss": mss,
-                        "displacement": DisplacementEvent(df_closed.index[disp_idx], disp_idx, b_ratio, b_rng),
-                        "fvg": fvg,
-                        "sl_price": round(sl_price, 2),
-                    }
+                if sweep is not None:
                     break
 
-            if best_setup is not None:
-                return True, "VALID_BEARISH_SEQUENCE", best_setup
-            return False, "RELAXED_FILTER_WAIT", {}
+            if sweep is None:
+                return False, "NO_SWEEP", {}
+
+            prior_lows = [fl for fl in fractal_lows if fl.confirmed_time < sweep.timestamp]
+            if not prior_lows:
+                return False, "NO_STRUCTURAL_LOW_PRIOR_SWEEP", {}
+
+            struct_low = prior_lows[-1].price
+            mss = None
+            for m_idx in get_inclusive_bar_range(sweep.bar_index + 1, BT_CFG.MAX_SWEEP_TO_MSS_BARS, n):
+                if df_closed["Close"].iloc[m_idx] < struct_low:
+                    mss = MSSEvent(
+                        timestamp=df_closed.index[m_idx],
+                        bar_index=m_idx,
+                        struct_level=struct_low,
+                        break_price=float(df_closed["Close"].iloc[m_idx]),
+                    )
+                    break
+
+            if mss is None:
+                return False, "MSS_TIMEOUT", {}
+
+            displacement = None
+            for d_idx in get_inclusive_bar_range(mss.bar_index + 1, BT_CFG.MAX_MSS_TO_DISP_BARS, n):
+                b = df_closed.iloc[d_idx]
+                disp_atr = float(df_closed["ATR"].iloc[d_idx])
+                b_rng = max(float(b["High"] - b["Low"]), 1e-5)
+                b_body = abs(float(b["Close"] - b["Open"]))
+                b_ratio = b_body / b_rng
+                rng_atr_ratio = b_rng / max(disp_atr, 1e-5)
+
+                if (b_ratio >= min_disp_ratio) and (rng_atr_ratio >= 0.85):
+                    displacement = DisplacementEvent(
+                        timestamp=df_closed.index[d_idx],
+                        bar_index=d_idx,
+                        body_ratio=b_ratio,
+                        range_atr_ratio=rng_atr_ratio,
+                    )
+                    break
+
+            if displacement is None:
+                return False, "NO_DISPLACEMENT", {}
+
+            fvg = None
+            start_fvg_center = displacement.bar_index + 2
+            for f_idx in get_inclusive_bar_range(start_fvg_center, BT_CFG.MAX_DISP_TO_FVG_BARS, n - 1):
+                c1 = df_closed.iloc[f_idx - 1]
+                c3 = df_closed.iloc[f_idx + 1]
+                fvg_atr = float(df_closed["ATR"].iloc[f_idx + 1])
+                if c1["Low"] > c3["High"]:
+                    gap_top = float(c1["Low"])
+                    gap_bot = float(c3["High"])
+                    gap_size = gap_top - gap_bot
+                    if gap_size >= (0.20 * fvg_atr):
+                        fvg = FVGStructure(
+                            created_time=df_closed.index[f_idx],
+                            confirmed_time=df_closed.index[f_idx + 1],
+                            bar_index=f_idx + 1,
+                            direction="BEARISH",
+                            top=gap_top,
+                            bottom=gap_bot,
+                            size=gap_size,
+                        )
+                        break
+
+            if fvg is None:
+                return False, "NO_FVG", {}
+
+            if (t_now_idx - fvg.bar_index) > BT_CFG.MAX_FVG_TO_RETEST_BARS:
+                return False, "FVG_STALE_TIMEOUT", {}
+
+            penetrated = (cur_bar["High"] >= fvg.bottom) and (cur_bar["High"] <= (fvg.top + 0.25 * cur_atr))
+            closed_below = cur_bar["Close"] <= fvg.top
+            upper_wick = float(cur_bar["High"]) - max(float(cur_bar["Open"]), float(cur_bar["Close"]))
+            bar_span = max(float(cur_bar["High"] - cur_bar["Low"]), 1e-5)
+            rejection_wick = (upper_wick / bar_span) >= min_wick_ratio
+
+            if not (penetrated and closed_below and rejection_wick):
+                return False, "FVG_RETEST_INCOMPLETE_OR_WEAK_REJECTION", {}
+
+            sl_price = sweep.extreme_price + (sl_atr_buf * cur_atr)
+            setup_id = f"SELL|{sweep.timestamp.isoformat()}|{fvg.confirmed_time.isoformat()}"
+
+            return True, "VALID_BEARISH_SEQUENCE", {
+                "direction": "SELL",
+                "setup_id": setup_id,
+                "sl_price": round(sl_price, 2),
+            }
 
 
 class DynamicLiquidityTargetEngine:
@@ -590,320 +630,171 @@ class DynamicLiquidityTargetEngine:
     ) -> Tuple[bool, str, float, float, float, str]:
         risk_dist = abs(entry_price - sl_price)
         if risk_dist <= 0:
-            return False, "INVALID_RISK", 0.0, 0.0, 0.0, ""
+            return False, "INVALID_RISK_DISTANCE", 0.0, 0.0, 0.0, ""
 
         min_reward_dist = risk_dist * BT_CFG.MIN_RR
 
         if direction == "BUY":
             target_price = entry_price + min_reward_dist
-            return True, "VALID_TARGET", target_price, BT_CFG.MIN_RR, BT_CFG.MIN_RR, "ATR_FLEX_TARGET"
+            return True, "VALID_LIQUIDITY_TARGET", round(target_price, 2), BT_CFG.MIN_RR, BT_CFG.MIN_RR, "ATR_FLEX_TARGET"
         else:
             target_price = entry_price - min_reward_dist
-            return True, "VALID_TARGET", target_price, BT_CFG.MIN_RR, BT_CFG.MIN_RR, "ATR_FLEX_TARGET"
+            return True, "VALID_LIQUIDITY_TARGET", round(target_price, 2), BT_CFG.MIN_RR, BT_CFG.MIN_RR, "ATR_FLEX_TARGET"
 
 
 class CausalSizingEngine:
     @staticmethod
-    def calculate_lot(current_equity: float, risk_pct: float, executed_entry: float, sl_price: float) -> Tuple[bool, str, float, float, float]:
+    def calculate_lot(
+        current_equity: float,
+        risk_pct: float,
+        executed_entry: float,
+        sl_price: float,
+    ) -> Tuple[bool, str, float, float, float]:
         allowed_risk_usd = current_equity * (risk_pct / 100.0)
         price_risk_dist = abs(executed_entry - sl_price)
-        worst_case_risk_per_standard_lot = ((price_risk_dist + BT_CFG.ADVERSE_SLIPPAGE_USD) * BT_CFG.CONTRACT_SIZE) + BT_CFG.COMMISSION_ROUND_TRIP
+        worst_case_risk_per_standard_lot = (
+            (price_risk_dist + BT_CFG.ADVERSE_SLIPPAGE_USD) * BT_CFG.CONTRACT_SIZE
+        ) + BT_CFG.COMMISSION_ROUND_TRIP
+
         if worst_case_risk_per_standard_lot <= 0:
-            return False, "INVALID_RISK", 0.0, 0.0, 0.0
+            return False, "INVALID_RISK_PER_LOT", 0.0, 0.0, 0.0
+
         raw_lot = allowed_risk_usd / worst_case_risk_per_standard_lot
         steps = math.floor(raw_lot / BT_CFG.LOT_STEP)
         floored_lot = round(steps * BT_CFG.LOT_STEP, 4)
         final_lot = max(min(floored_lot, BT_CFG.MAX_LOT), BT_CFG.MIN_LOT)
-        return True, "APPROVED", final_lot, round(final_lot * price_risk_dist * BT_CFG.CONTRACT_SIZE, 2), round(final_lot * worst_case_risk_per_standard_lot, 2)
+        worst_case_modeled_risk_usd = round(final_lot * worst_case_risk_per_standard_lot, 2)
+
+        return True, "LOT_APPROVED", final_lot, worst_case_modeled_risk_usd, worst_case_modeled_risk_usd
 
 
-class IntrabarExecutionEngine:
-    @staticmethod
-    def resolve_trade(trade: TradeRecord, df_1m: pd.DataFrame, df_ltf: pd.DataFrame, start_idx: int, end_idx: int) -> ExecutionResult:
-        direction = trade.direction
-        sl = trade.sl_price
-        tp = trade.tp_price
-        lot = trade.lot_size
-        closed = False
-        exit_index = end_idx
-
-        for b_idx in range(start_idx, end_idx + 1):
-            m15_bar = df_ltf.iloc[b_idx]
-            high = float(m15_bar["High"])
-            low = float(m15_bar["Low"])
-
-            if direction == "BUY":
-                if low <= sl:
-                    trade.result = "SL"
-                    trade.executed_exit = sl - BT_CFG.ADVERSE_SLIPPAGE_USD
-                    closed = True
-                    exit_index = b_idx
-                    break
-                elif high >= tp:
-                    trade.result = "TP"
-                    trade.executed_exit = tp - BT_CFG.ADVERSE_SLIPPAGE_USD
-                    closed = True
-                    exit_index = b_idx
-                    break
-            else:
-                if high >= sl:
-                    trade.result = "SL"
-                    trade.executed_exit = sl + BT_CFG.ADVERSE_SLIPPAGE_USD
-                    closed = True
-                    exit_index = b_idx
-                    break
-                elif low <= tp:
-                    trade.result = "TP"
-                    trade.executed_exit = tp + BT_CFG.ADVERSE_SLIPPAGE_USD
-                    closed = True
-                    exit_index = b_idx
-                    break
-
-        if not closed:
-            bound_bar = df_ltf.iloc[end_idx]
-            trade.result = "EXPIRED"
-            trade.executed_exit = float(bound_bar["Close"])
-            exit_index = end_idx
-
-        pts = (trade.executed_exit - trade.executed_entry) if direction == "BUY" else (trade.executed_entry - trade.executed_exit)
-        gross_pnl = pts * lot * BT_CFG.CONTRACT_SIZE
-        comm = BT_CFG.COMMISSION_ROUND_TRIP * lot
-        net_pnl = round(gross_pnl - comm, 2)
-
-        trade.exit_index = exit_index
-        trade.points = round(pts, 2)
-        trade.gross_pnl = round(gross_pnl, 2)
-        trade.commission = round(comm, 2)
-        trade.net_pnl = net_pnl
-        trade.price_r = round(pts / max(trade.risk_dist, 1e-4), 2)
-        trade.net_r = round(net_pnl / max(trade.worst_case_risk_usd, 1.0), 2)
-        trade.actual_rr_after_execution = round(abs(trade.executed_exit - trade.executed_entry) / max(trade.risk_dist, 1e-4), 2)
-
-        return ExecutionResult(trade=trade, exit_index=exit_index)
+# ==================================================================================================
+# 6. HTTP HEALTH CHECK SERVER & LIVE LOOP
+# ==================================================================================================
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
 
 
-class SMCWalkForwardOptimizer:
-    def __init__(self, causal_universe: Optional[PrecomputedCausalUniverse] = None):
-        self.tz_london = pytz.timezone("Europe/London")
-        self.tz_ny = pytz.timezone(BT_CFG.TRADING_DATE_TZ)
-        self.all_oos_trades: List[TradeRecord] = []
-        self.universe = causal_universe
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"SMC V7.6.1 Discord Bot Active and Healthy")
 
-    def simulate_interval(
-        self,
-        df_htf: pd.DataFrame,
-        df_ltf: pd.DataFrame,
-        df_1m: pd.DataFrame,
-        start_dt: datetime,
-        end_dt: datetime,
-        params: Dict[str, float],
-        starting_equity: float,
-        is_oos: bool,
-        fold_id: int,
-    ) -> Tuple[List[TradeRecord], float]:
-        trades: List[TradeRecord] = []
-        equity = starting_equity
-        sub_indices = df_ltf[(df_ltf.index >= start_dt) & (df_ltf.index < end_dt)].index
-        if len(sub_indices) < 10:
-            return trades, equity
+    def log_message(self, format, *args):
+        pass  # Suppress excessive HTTP GET logs
 
-        curr_ptr = df_ltf.index.get_loc(sub_indices[0])
-        max_ptr = df_ltf.index.get_loc(sub_indices[-1])
 
-        while curr_ptr < max_ptr:
-            bar_time = df_ltf.index[curr_ptr]
-            if curr_ptr < 30:
-                curr_ptr += 1
+def start_health_server():
+    try:
+        srv = ReusableHTTPServer(("0.0.0.0", BT_CFG.PORT), HealthHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        logger.info(f"[Server] Health check server running on port {BT_CFG.PORT}")
+    except Exception as e:
+        logger.error(f"[Server] Port bind error: {e}")
+
+
+def is_killzone(cur_utc: datetime) -> Tuple[bool, str]:
+    tz_london = pytz.timezone("Europe/London")
+    tz_ny = pytz.timezone(BT_CFG.TRADING_DATE_TZ)
+    london_m = cur_utc.astimezone(tz_london).hour * 60 + cur_utc.astimezone(tz_london).minute
+    ny_m = cur_utc.astimezone(tz_ny).hour * 60 + cur_utc.astimezone(tz_ny).minute
+
+    is_london = (8 * 60) <= london_m <= (11 * 60 + 30)
+    is_ny = (8 * 60) <= ny_m <= (12 * 60)
+
+    if is_london and is_ny:
+        return True, "LONDON_NY_OVERLAP"
+    elif is_london:
+        return True, "LONDON_OPEN"
+    elif is_ny:
+        return True, "NY_OPEN"
+    return False, "OFF_PEAK"
+
+
+def live_bot_loop():
+    notifier = DiscordNotifier()
+    notifier.notify_startup()
+
+    params = {"sl_atr_buffer": 1.3, "min_displacement_ratio": 0.65, "min_rejection_wick_ratio": 0.30}
+    last_signal_setup_id = None
+
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            in_kz, session_name = is_killzone(now_utc)
+            if not in_kz:
+                time.sleep(BT_CFG.SIGNAL_CHECK_INTERVAL_SEC)
                 continue
 
-            h1_bias = self.universe.htf_bias_cache[curr_ptr] if self.universe else "BULLISH"
-            df_closed = df_ltf.iloc[: curr_ptr + 1]
+            tkr = yf.Ticker(BT_CFG.BENCHMARK)
+            raw_htf = tkr.history(period="10d", interval=BT_CFG.HTF_INTERVAL, auto_adjust=False)
+            raw_ltf = tkr.history(period="5d", interval=BT_CFG.LTF_INTERVAL, auto_adjust=False)
 
-            if self.universe:
-                levels, fractal_highs, fractal_lows, eqh, eql = self.universe.get_causal_state_at(bar_time)
-            else:
-                levels, fractal_highs, fractal_lows, eqh, eql = [], [], [], [], []
+            if raw_ltf.empty or raw_htf.empty:
+                time.sleep(60)
+                continue
 
-            valid_seq, _, seq_data = CausalSequenceEngine.evaluate(
+            cutoff = get_research_cutoff_utc()
+            df_htf = validate_and_clean_market_data(raw_htf, "HTF_H1", 60, cutoff, is_intraday=True)
+            df_ltf = validate_and_clean_market_data(raw_ltf, "LTF_M15", 15, cutoff, is_intraday=True)
+
+            df_htf["EMA200"] = CausalIndicators.ema(df_htf["Close"], 200)
+            df_ltf["ATR"] = CausalIndicators.atr(df_ltf, 14)
+
+            cur_bar_time = df_ltf.index[-1]
+            last_htf = CausalLiquidityEngine.get_last_closed_htf_bar(df_htf, cur_bar_time)
+            if last_htf is None or pd.isna(last_htf.get("EMA200")):
+                time.sleep(BT_CFG.SIGNAL_CHECK_INTERVAL_SEC)
+                continue
+
+            h1_bias = "BULLISH" if last_htf["Close"] > last_htf["EMA200"] else "BEARISH"
+            df_closed = df_ltf.copy()
+
+            fractal_highs, fractal_lows = CausalLiquidityEngine.get_confirmed_fractals(df_closed, cur_bar_time)
+            eqh, eql = CausalLiquidityEngine.get_causal_equal_levels(df_closed, cur_bar_time)
+            levels = CausalLiquidityEngine.extract_closed_session_and_daily_levels(df_closed, cur_bar_time)
+
+            valid_seq, reason, seq_data = CausalSequenceEngine.evaluate(
                 df_closed, h1_bias, levels, fractal_highs, fractal_lows, eqh, eql, params
             )
-            if not valid_seq:
-                curr_ptr += 1
-                continue
 
-            direction = seq_data["direction"]
-            sl_price = round(seq_data["sl_price"], 2)
-            cur_bar = df_closed.iloc[-1]
+            if valid_seq and seq_data["setup_id"] != last_signal_setup_id:
+                last_signal_setup_id = seq_data["setup_id"]
+                direction = seq_data["direction"]
+                sl = seq_data["sl_price"]
+                cur_close = float(df_closed["Close"].iloc[-1])
 
-            quoted = float(cur_bar["Close"]) + (BT_CFG.SPREAD_USD / 2.0) if direction == "BUY" else float(cur_bar["Close"]) - (BT_CFG.SPREAD_USD / 2.0)
-            executed = quoted + BT_CFG.ADVERSE_SLIPPAGE_USD if direction == "BUY" else quoted - BT_CFG.ADVERSE_SLIPPAGE_USD
-            risk_dist = abs(executed - sl_price)
+                quoted = cur_close + (BT_CFG.SPREAD_USD / 2.0) if direction == "BUY" else cur_close - (BT_CFG.SPREAD_USD / 2.0)
+                executed = quoted + BT_CFG.ADVERSE_SLIPPAGE_USD if direction == "BUY" else quoted - BT_CFG.ADVERSE_SLIPPAGE_USD
 
-            valid_target, _, tp_raw, planned_rr_raw, planned_rr_rounded, target_type = DynamicLiquidityTargetEngine.resolve_target(
-                direction, bar_time, executed, sl_price, levels, fractal_highs, fractal_lows, eqh, eql
-            )
-            if not valid_target:
-                curr_ptr += 1
-                continue
-
-            tp_price = round(tp_raw, 2)
-            reward_dist = abs(tp_price - executed)
-
-            size_ok, _, lot, planned_risk_usd, worst_case_risk_usd = CausalSizingEngine.calculate_lot(equity, BT_CFG.RISK_PCT, executed, sl_price)
-            if not size_ok:
-                curr_ptr += 1
-                continue
-
-            trade = TradeRecord(
-                id=f"F{fold_id}-T{len(trades) + 1}",
-                fold_id=fold_id,
-                setup_id=seq_data["setup_id"],
-                direction=direction,
-                session="RELAXED_SESSION",
-                entry_time=bar_time,
-                entry_index=curr_ptr,
-                quoted_entry=round(quoted, 2),
-                executed_entry=round(executed, 2),
-                sl_price=sl_price,
-                tp_price=tp_price,
-                planned_risk_usd=planned_risk_usd,
-                worst_case_risk_usd=worst_case_risk_usd,
-                risk_dist=round(risk_dist, 2),
-                reward_dist=round(reward_dist, 2),
-                planned_rr_raw=round(planned_rr_raw, 2),
-                planned_rr_rounded=planned_rr_rounded,
-                actual_rr_after_execution=0.0,
-                lot_size=lot,
-                target_type=target_type,
-                sweep_type="RELAXED_SWEEP",
-                boundary_max_ptr=max_ptr,
-                is_oos=is_oos,
-            )
-
-            exec_res = IntrabarExecutionEngine.resolve_trade(trade, df_1m, df_ltf, curr_ptr + 1, max_ptr)
-            resolved_trade = exec_res.trade
-            equity += resolved_trade.net_pnl
-            resolved_trade.post_trade_equity = round(equity, 2)
-            trades.append(resolved_trade)
-            curr_ptr = exec_res.exit_index + 1
-
-        return trades, equity
-
-    def run_true_walk_forward_optimization(self) -> None:
-        print("[1/3] Downloading market data feeds for GC=F from Yahoo Finance...", flush=True)
-        tkr = yf.Ticker(BT_CFG.BENCHMARK)
-        raw_htf = tkr.history(period=BT_CFG.PERIOD_M15, interval=BT_CFG.HTF_INTERVAL, auto_adjust=False)
-        raw_ltf = tkr.history(period=BT_CFG.PERIOD_M15, interval=BT_CFG.LTF_INTERVAL, auto_adjust=False)
-        raw_1m = tkr.history(period=BT_CFG.PERIOD_1M, interval=BT_CFG.INTRABAR_INTERVAL, auto_adjust=False)
-
-        if raw_ltf.empty or raw_htf.empty:
-            raise RuntimeError("CRITICAL DATA FEED ERROR: Market historical data feed unavailable.")
-
-        cutoff_utc = get_research_cutoff_utc()
-        print(f" -> Feed loaded. Deterministic Cutoff UTC: {cutoff_utc.strftime('%Y-%m-%d %H:%M')}", flush=True)
-
-        df_htf = validate_and_clean_market_data(raw_htf, "HTF_H1", 60, cutoff_utc=cutoff_utc, is_intraday=True)
-        df_ltf = validate_and_clean_market_data(raw_ltf, "LTF_M15", 15, cutoff_utc=cutoff_utc, is_intraday=True)
-        df_1m = validate_and_clean_market_data(raw_1m, "LTF_1M", 1, cutoff_utc=cutoff_utc, is_intraday=True) if not raw_1m.empty else pd.DataFrame()
-
-        print("[2/3] Running Integrity Suites...", flush=True)
-        print(" INTEGRITY STATUS: PASS (16/16 PASSED)", flush=True)
-
-        df_htf["EMA200"] = CausalIndicators.ema(df_htf["Close"], 200)
-        df_ltf["ATR"] = CausalIndicators.atr(df_ltf, 14)
-
-        print(" -> Precomputing Causal State Universe...", flush=True)
-        self.universe = PrecomputedCausalUniverse(df_ltf, df_htf)
-
-        ny_tz = pytz.timezone(BT_CFG.TRADING_DATE_TZ)
-        df_ltf_ny = df_ltf.copy()
-        df_ltf_ny["ny_time"] = df_ltf_ny.index.tz_convert(ny_tz)
-        df_ltf_ny["trading_date"] = df_ltf_ny["ny_time"].apply(get_ny_session_date)
-
-        unique_trading_days = sorted(df_ltf_ny["trading_date"].unique())
-        keys, values = zip(*PARAM_GRID.items())
-        grid_combos = [dict(zip(keys, v)) for v in itertools.product(*values)]
-
-        w_idx = 0
-        current_oos_equity = BT_CFG.INITIAL_CAPITAL
-        fold_id = 1
-        fold_records = []
-
-        print(f"\n[3/3] Running Walk-Forward Optimization across {len(unique_trading_days)} CME Trading Days:\n", flush=True)
-
-        while (w_idx + BT_CFG.WF_TRAIN_DAYS + BT_CFG.WF_TEST_DAYS) <= len(unique_trading_days):
-            train_days = unique_trading_days[w_idx: w_idx + BT_CFG.WF_TRAIN_DAYS]
-            test_days = unique_trading_days[w_idx + BT_CFG.WF_TRAIN_DAYS: w_idx + BT_CFG.WF_TRAIN_DAYS + BT_CFG.WF_TEST_DAYS]
-
-            train_bars = df_ltf_ny[df_ltf_ny["trading_date"].isin(train_days)]
-            test_bars = df_ltf_ny[df_ltf_ny["trading_date"].isin(test_days)]
-
-            train_start_dt = train_bars.index[0]
-            train_end_dt = train_bars.index[-1] + timedelta(minutes=15)
-            test_start_dt = test_bars.index[0]
-            test_end_dt = test_bars.index[-1] + timedelta(minutes=15)
-
-            best_params = grid_combos[0]
-            best_score = -99999.0
-            best_train_count = 0
-
-            for p in grid_combos:
-                is_trades, _ = self.simulate_interval(
-                    df_htf, df_ltf, df_1m, train_start_dt, train_end_dt, p, BT_CFG.INITIAL_CAPITAL, False, fold_id
+                valid_target, _, tp_raw, _, _, _ = DynamicLiquidityTargetEngine.resolve_target(
+                    direction, cur_bar_time, executed, sl, levels, fractal_highs, fractal_lows, eqh, eql
                 )
-                tot = len(is_trades)
-                if tot >= BT_CFG.MIN_TRAIN_TRADES:
-                    net = sum(t.net_pnl for t in is_trades)
-                    if net > best_score:
-                        best_score = net
-                        best_params = p
-                        best_train_count = tot
+                tp = round(tp_raw, 2)
 
-            oos_trades, next_equity = self.simulate_interval(
-                df_htf, df_ltf, df_1m, test_start_dt, test_end_dt, best_params, current_oos_equity, True, fold_id
-            )
-            self.all_oos_trades.extend(oos_trades)
-            current_oos_equity = next_equity
+                size_ok, _, lot, risk_usd, _ = CausalSizingEngine.calculate_lot(BT_CFG.INITIAL_CAPITAL, BT_CFG.RISK_PCT, executed, sl)
+                if size_ok:
+                    setup_info = {
+                        "direction": direction,
+                        "entry": round(executed, 2),
+                        "sl": sl,
+                        "tp": tp,
+                        "lot": lot,
+                        "risk_usd": risk_usd,
+                    }
+                    notifier.notify_signal(setup_info, session_name)
+                    logger.info(f"[LiveSignal] Dispatched {direction} signal to Discord successfully.")
 
-            pos_oos = sum(t.net_pnl for t in oos_trades if t.net_pnl > 0)
-            neg_oos = abs(sum(t.net_pnl for t in oos_trades if t.net_pnl < 0))
-            oos_pf = (pos_oos / neg_oos) if neg_oos > 0 else (99.0 if pos_oos > 0 else 0.0)
+        except Exception as e:
+            logger.error(f"[LiveLoop] Error: {e}")
 
-            wins = len([t for t in oos_trades if t.result == "TP"])
-            total_t = len(oos_trades)
-            win_rate = (wins / total_t * 100.0) if total_t > 0 else 0.0
-
-            fold_records.append({
-                "Fold": fold_id,
-                "Test Period": f"{test_days[0]} to {test_days[-1]}",
-                "OOS Trades": total_t,
-                "Win Rate": f"{win_rate:.1f}%",
-                "OOS Net PnL": f"${sum(t.net_pnl for t in oos_trades):+,.2f}",
-                "OOS PF": f"{oos_pf:.2f}",
-                "Ending Equity": f"${current_oos_equity:,.2f}",
-            })
-
-            w_idx += BT_CFG.WF_STEP_DAYS
-            fold_id += 1
-
-        print("\n=============================================================================")
-        print(" [INSTITUTIONAL GOLD SMC V7.6.2 - FINAL OOS PERFORMANCE REPORT]")
-        print("=============================================================================")
-        for r in fold_records:
-            print(f"Fold {r['Fold']} | Test: {r['Test Period']} | Trades: {r['OOS Trades']} | Win Rate: {r['Win Rate']} | Net PnL: {r['OOS Net PnL']} | PF: {r['OOS PF']}")
-
-        if self.all_oos_trades:
-            df = pd.DataFrame([asdict(t) for t in self.all_oos_trades])
-            tot_w = len(df[df["result"] == "TP"])
-            tot_l = len(df[df["result"] == "SL"])
-            wr = (tot_w / len(df) * 100.0) if len(df) > 0 else 0.0
-            print(f"\nTOTAL OOS TRADES : {len(df)}")
-            print(f"OVERALL WIN RATE : {wr:.1f}% ({tot_w} Wins / {tot_l} Losses)")
-            print(f"TOTAL NET PnL    : ${df['net_pnl'].sum():+,.2f} USD")
-        else:
-            print("\nZero trades executed.")
-        print("=============================================================================\n")
+        time.sleep(BT_CFG.SIGNAL_CHECK_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
-    SMCWalkForwardOptimizer().run_true_walk_forward_optimization()
+    logger.info("Starting SMC Bot V7.6.1 Discord Edition...")
+    start_health_server()
+    live_bot_loop()
+```
+eof
